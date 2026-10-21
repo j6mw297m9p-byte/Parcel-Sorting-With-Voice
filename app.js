@@ -1,15 +1,37 @@
 "use strict";
 
-// ---------- State ----------
-let roads = [];       // parsed rows from roads.csv
-let pending = null;   // { matches } while waiting for a house number or postcode
+// ---------- Settings ----------
+const PAUSE_MS = 900;          // pause after typing before a house number or postcode is read aloud
+const SPEECH_RATE = 1.2;       // 1 is normal speed
+const MIN_SUGGEST = 0.6;       // 0 to 1: how close a name must be to be offered as "did you mean"
+const AREA_KEY = "sortingArea";
+const AREA_SPOKEN = { ME10: "ME ten", ME9: "ME nine" };
+const OPTION_STYLE = "width:100%;text-align:left;padding:12px;font-size:17px;background:#fff;color:#1d1d1f;border:1px solid #d9d9d6;border-radius:8px;";
 
-let letterGrid, walkGrid, results, roadTab, walkTab;
+// Words ignored when comparing names, so "Chalkwell" matches "Chalkwell Road"
+const SUFFIXES = new Set([
+  "ROAD", "RD", "STREET", "ST", "AVENUE", "AVE", "CLOSE", "DRIVE", "DR", "LANE", "WAY",
+  "COURT", "CT", "TERRACE", "CRESCENT", "GARDENS", "GROVE", "PARK", "WALK", "PLACE",
+  "MEWS", "RISE", "HOUSE", "THE"
+]);
+
+const YES_WORDS = new Set(["yes", "yeah", "yep", "yup", "correct", "right", "that one", "thats it", "ok", "okay", "sure"]);
+const NO_WORDS = new Set(["no", "nope", "wrong", "not that", "none", "neither", "try again"]);
+
+// ---------- State ----------
+let roads = [];               // every row from roads.csv, each tagged with its area
+let selectedArea = "ME10";    // "ME10" or "ME9"
+let pending = null;           // { matches } while waiting for a house number or postcode
+let suggestions = null;       // { options } while waiting for yes, a number or a tap
+let typingTimer = null;
+let speechUnlocked = false;
+
+let letterGrid, walkGrid, results, roadTab, walkTab, me10Tab, me9Tab, areaLabel;
 let input, micBtn, transcriptEl, resetBtn;
 
 const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
 
-// Matches a trailing house list such as "QUARTZ WAY 1-5 7 9 11" (no " - " separator)
+// Trailing house list with no " - " separator, e.g. "QUARTZ WAY 1-5 7 9 11"
 const HOUSES_AFTER_NAME = /^(.*?)\s+(\d{1,3}(?:-\d{1,3})?(?:\s+\d{1,3}(?:-\d{1,3})?)*)$/;
 
 const NUMBER_WORDS = {
@@ -26,6 +48,9 @@ document.addEventListener("DOMContentLoaded", () => {
   results = document.getElementById("results");
   roadTab = document.getElementById("roadTab");
   walkTab = document.getElementById("walkTab");
+  me10Tab = document.getElementById("me10Tab");
+  me9Tab = document.getElementById("me9Tab");
+  areaLabel = document.getElementById("areaLabel");
   input = document.getElementById("roadSearch");
   micBtn = document.getElementById("micBtn");
   transcriptEl = document.getElementById("transcript");
@@ -33,13 +58,26 @@ document.addEventListener("DOMContentLoaded", () => {
 
   roadTab.onclick = () => switchMode("road");
   walkTab.onclick = () => switchMode("walk");
+  me10Tab.onclick = () => setArea("ME10", false);
+  me9Tab.onclick = () => setArea("ME9", false);
   resetBtn.onclick = reset;
 
-  input.addEventListener("input", () => handleInput(input.value, true));
+  // The first tap anywhere on the page unlocks spoken replies on iPhone
+  document.addEventListener("pointerdown", unlockSpeech);
+
+  input.addEventListener("input", () => {
+    clearTimeout(typingTimer);
+    handleInput(input.value, "live");
+    if (pending && isNumberOrPostcode(input.value)) {
+      typingTimer = setTimeout(() => handleInput(input.value, "pause"), PAUSE_MS);
+    }
+  });
+
   input.addEventListener("keydown", e => {
     if (e.key === "Enter") {
+      clearTimeout(typingTimer);
       unlockSpeech();
-      handleInput(input.value, false);
+      handleInput(input.value, "final");
     }
   });
 
@@ -56,8 +94,8 @@ function loadData() {
     })
     .then(text => {
       roads = parseCsv(text);
-      buildLetterGrid();
-      buildWalkGrid();
+      applyArea(savedArea() || "ME10");
+      buildGrids();
       switchMode("road");
     })
     .catch(err => {
@@ -69,15 +107,23 @@ function loadData() {
 function parseCsv(text) {
   const lines = text.replace(/^\uFEFF/, "").trim().split(/\r?\n/).slice(1);
   const out = [];
+  let areaName = "ME10";
 
   for (const line of lines) {
     const cols = splitCsvLine(line);
     const road = (cols[0] || "").trim();
+
+    if (!road) {
+      // Blank rows sit between the ME10 list and the ME9 list
+      if (out.length && areaName === "ME10") areaName = "ME9";
+      continue;
+    }
+
     const walk = (cols[2] || "").trim();   // Duty column
-    if (!road || !walk) continue;          // skips the blank separator rows
+    if (!walk) continue;
 
     const letter = (cols[1] || "").trim().toUpperCase() || firstLetter(road);
-    out.push(makeEntry(road, walk, letter));
+    out.push(makeEntry(road, walk, letter, areaName));
   }
   return out;
 }
@@ -96,7 +142,7 @@ function splitCsvLine(line) {
   return cols;
 }
 
-function makeEntry(road, walk, letter) {
+function makeEntry(road, walk, letter, areaName) {
   // Split "BASE - DETAIL", or a trailing house list, into a base name and a detail
   const sep = road.indexOf(" - ");
   let base, detail;
@@ -138,6 +184,7 @@ function makeEntry(road, walk, letter) {
 
   return {
     road,
+    areaName,
     base,
     detail,
     walk,
@@ -157,7 +204,7 @@ function firstLetter(name) {
   return normalise(name.replace(/^THE\s+/i, ""))[0] || "";
 }
 
-// ---------- Matching helpers ----------
+// ---------- Matching ----------
 function normalise(s) {
   return String(s).toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
@@ -167,20 +214,24 @@ function walkKey(s) {
   return normalise(s).replace(/^([A-Z]*)0+(?=\d)/, "$1");
 }
 
+function areaRoads() {
+  return roads.filter(r => r.areaName === selectedArea);
+}
+
 function findWalk(q) {
   const k = walkKey(q);
   if (!k) return [];
-  return roads.filter(r => walkKey(r.walk) === k);
+  return areaRoads().filter(r => walkKey(r.walk) === k);
 }
 
-function findRoads(q) {
+function findRoads(q, list = areaRoads()) {
   const n = normalise(q);
   if (!n) return [];
-  const exact = roads.filter(r => r.baseN === n);
+  const exact = list.filter(r => r.baseN === n);
   if (exact.length) return exact;
-  const starts = roads.filter(r => r.baseN.startsWith(n));
+  const starts = list.filter(r => r.baseN.startsWith(n));
   if (starts.length) return starts;
-  return n.length >= 4 ? roads.filter(r => r.baseN.includes(n)) : [];
+  return n.length >= 4 ? list.filter(r => r.baseN.includes(n)) : [];
 }
 
 function needsDetail(matches) {
@@ -189,9 +240,13 @@ function needsDetail(matches) {
     matches.some(m => m.detail);
 }
 
+function looksLikeRoad(q) {
+  return normalise(q).length >= 3 && findRoads(q).length > 0;
+}
+
 function isNumberOrPostcode(q) {
   const n = normalise(q);
-  return /^\d+[A-Z]?$/.test(n) || (/^[A-Z]{1,2}\d/.test(n) && n.length <= 8);
+  return /^\d+[A-Z]?$/.test(n) || /^[A-Z]{1,2}\d/.test(n);
 }
 
 function housesMatch(e, num) {
@@ -230,16 +285,138 @@ function answerPending(q) {
   return hits.length ? hits : null;
 }
 
-// ---------- Grids ----------
+// ---------- Forgiving matching ----------
+// Reduces a name to its distinctive part: "Chalkwell Road" becomes "CHALKWELL"
+function coreName(s) {
+  const words = String(s).toUpperCase().replace(/[^A-Z0-9 ]/g, " ").split(/\s+/)
+    .filter(w => w && !SUFFIXES.has(w));
+  return words.length ? words.join("") : normalise(s);
+}
+
+function editDistance(a, b) {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+function similarity(a, b) {
+  const max = Math.max(a.length, b.length);
+  return max ? 1 - editDistance(a, b) / max : 0;
+}
+
+function scoreName(spokenCore, cand) {
+  if (!spokenCore || !cand) return 0;
+  if (spokenCore === cand) return 1;
+  let score = similarity(spokenCore, cand);
+  const shorter = Math.min(spokenCore.length, cand.length);
+  // Covers a partial name such as "Chalk", or "Bell Rod" heard as BELLROD for BELL
+  if (shorter >= 4 && (cand.startsWith(spokenCore) || spokenCore.startsWith(cand))) {
+    score = Math.max(score, 0.8);
+  }
+  return score;
+}
+
+// Returns the closest road names in the selected area, best first
+function suggestRoads(spokenList, limit = 3) {
+  const bases = [...new Map(
+    areaRoads().map(r => [r.baseN, { base: r.base, core: coreName(r.base) }])
+  ).values()];
+
+  const best = new Map();
+  for (const spoken of spokenList) {
+    const said = coreName(spoken);
+    if (said.length < 3) continue;
+    for (const b of bases) {
+      const score = scoreName(said, b.core);
+      if (score < MIN_SUGGEST) continue;
+      const prev = best.get(b.base);
+      if (!prev || prev.score < score) best.set(b.base, { ...b, score });
+    }
+  }
+  return [...best.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+}
+
+// Speech often hears letter codes as words: "you 70" for U070, "tea 61" for T61
+function fixCodes(s) {
+  return s
+    .replace(/\b(you|u)\s*(\d)/gi, "U$2")
+    .replace(/\b(tea|tee|t)\s*(\d)/gi, "T$2")
+    .replace(/\b(zed|zee|said|z)\s*(\d)/gi, "Z$2");
+}
+
+// ---------- Area (ME10 / ME9) ----------
+function areaFromText(text) {
+  const n = normalise(text);
+  return n === "ME10" || n === "ME9" ? n : null;
+}
+
+function savedArea() {
+  try {
+    const v = localStorage.getItem(AREA_KEY);
+    return v === "ME10" || v === "ME9" ? v : null;
+  } catch (e) {
+    return null;   // some private browsing modes block storage
+  }
+}
+
+function rememberArea(name) {
+  try {
+    localStorage.setItem(AREA_KEY, name);
+  } catch (e) {
+    // ignore: the choice just won't be remembered
+  }
+}
+
+function applyArea(name) {
+  selectedArea = name;
+  me10Tab.classList.toggle("active", name === "ME10");
+  me9Tab.classList.toggle("active", name === "ME9");
+  areaLabel.textContent = name;
+}
+
+// speakIt is true for typed or spoken changes, false for taps
+function setArea(name, speakIt) {
+  applyArea(name);
+  rememberArea(name);
+  pending = null;
+  clearTimeout(typingTimer);
+  buildGrids();
+
+  const q = input.value.trim();
+  if (q && !areaFromText(q)) {
+    // Run the current search again in the new area
+    handleInput(q, speakIt ? "final" : "live");
+    return;
+  }
+
+  input.value = "";
+  clearResults();
+  showNote(`Showing ${name}. Type or say a road name.`);
+  if (speakIt) speak(`Showing ${AREA_SPOKEN[name]}`);
+}
+
+// ---------- Grids and tabs ----------
+function buildGrids() {
+  buildLetterGrid();
+  buildWalkGrid();
+}
+
 function buildLetterGrid() {
   letterGrid.innerHTML = "";
-  const letters = [...new Set(roads.map(r => r.letter).filter(l => /^[A-Z]$/.test(l)))].sort();
+  const letters = [...new Set(areaRoads().map(r => r.letter).filter(l => /^[A-Z]$/.test(l)))].sort();
   letters.forEach(letter => addButton(letterGrid, letter, () => showLetter(letter)));
 }
 
 function buildWalkGrid() {
   walkGrid.innerHTML = "";
-  const walks = [...new Set(roads.map(r => r.walk))]
+  const walks = [...new Set(areaRoads().map(r => r.walk))]
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   walks.forEach(walk => addButton(walkGrid, walk, () => showByWalk(walk)));
 }
@@ -268,13 +445,16 @@ function compactGrids() {
 }
 
 function clearResults() {
+  suggestions = null;
   results.innerHTML = "";
   letterGrid.classList.remove("compact");
   walkGrid.classList.remove("compact");
 }
 
 function reset() {
+  clearTimeout(typingTimer);
   pending = null;
+  suggestions = null;
   input.value = "";
   transcriptEl.textContent = "";
   clearResults();
@@ -282,17 +462,18 @@ function reset() {
 }
 
 // ---------- Display ----------
-function showLetter(letter) {
+function showLetter(letter, speakIt = false) {
   pending = null;
-  showDuties(roads.filter(r => r.letter === letter), false);
+  showDuties(areaRoads().filter(r => r.letter === letter), speakIt);
 }
 
-function showByWalk(walk) {
+function showByWalk(walk, speakIt = false) {
   pending = null;
-  showDuties(roads.filter(r => r.walk === walk), false);
+  showDuties(areaRoads().filter(r => r.walk === walk), speakIt);
 }
 
 function showDuties(matches, speakIt) {
+  suggestions = null;
   compactGrids();
   results.innerHTML = "";
 
@@ -329,6 +510,7 @@ function resultRow(m) {
 }
 
 function showNote(text) {
+  suggestions = null;
   results.innerHTML = "";
   const li = document.createElement("li");
   li.className = "note";
@@ -343,40 +525,132 @@ function askDetail(matches, message, speakIt) {
   if (speakIt) speak(message);
 }
 
-// ---------- Typed and spoken input ----------
-// live = true while typing (no speech); false on Enter or after a voice result
-function handleInput(text, live) {
-  const q = text.trim();
-  if (!q) {
-    clearResults();
-    pending = null;
-    return;
-  }
+// ---------- Suggestions ("did you mean") ----------
+function showSuggestions(options, speakIt) {
+  suggestions = { options };
+  compactGrids();
+  results.innerHTML = "";
 
-  if (pending && isNumberOrPostcode(q)) {
-    const hits = answerPending(q);
-    if (hits) {
-      showDuties(hits, !live);
-    } else if (!live) {
-      askDetail(pending.matches, `No match for ${q}. Try another house number or postcode.`, true);
+  const heading = document.createElement("li");
+  heading.className = "note";
+  heading.textContent = options.length === 1 ? "Did you mean this?" : "Did you mean one of these?";
+  results.appendChild(heading);
+
+  options.forEach((opt, i) => {
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = options.length > 1 ? `${i + 1}. ${opt.base}` : opt.base;
+    btn.style.cssText = OPTION_STYLE;
+    btn.onclick = () => chooseSuggestion(i);
+    li.appendChild(btn);
+    results.appendChild(li);
+  });
+
+  const none = document.createElement("li");
+  const noneBtn = document.createElement("button");
+  noneBtn.type = "button";
+  noneBtn.textContent = "None of these";
+  noneBtn.style.cssText = OPTION_STYLE + "color:#555;border-style:dashed;";
+  noneBtn.onclick = cancelSuggestions;
+  none.appendChild(noneBtn);
+  results.appendChild(none);
+
+  if (speakIt) speak(suggestionPrompt(options));
+}
+
+function suggestionPrompt(options) {
+  if (options.length === 1) return `Did you mean ${options[0].base}? Say yes or no.`;
+  return `Did you mean: ${options.map((o, i) => `${i + 1}, ${o.base}`).join(". ")}? Say the number.`;
+}
+
+function chooseSuggestion(i) {
+  const opt = suggestions ? suggestions.options[i] : null;
+  suggestions = null;
+  if (!opt) return;
+  input.value = opt.base;
+  lookup(opt.base, true);   // a road with several entries still asks for the house number
+}
+
+function cancelSuggestions() {
+  suggestions = null;
+  input.value = "";
+  showNote("Okay. Say or type the road name again.");
+  speak("Okay. Say the road again.");
+}
+
+// Handles "yes", "no", a number, or the name of an option. Returns true if it was used.
+function handleSuggestionVoice(alts) {
+  const options = suggestions.options;
+  for (const raw of alts) {
+    const said = wordsToDigits(raw.toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim())
+      .replace(/^(number|option) /, "");
+
+    if (YES_WORDS.has(said)) { chooseSuggestion(0); return true; }
+    if (NO_WORDS.has(said)) { cancelSuggestions(); return true; }
+
+    const n = Number(said);
+    if (Number.isInteger(n) && n >= 1 && n <= options.length) {
+      chooseSuggestion(n - 1);
+      return true;
     }
+
+    const idx = options.findIndex(o => coreName(raw) === o.core);
+    if (idx !== -1) { chooseSuggestion(idx); return true; }
+  }
+  return false;
+}
+
+// ---------- Typed and spoken input ----------
+// mode "live":  while typing, shows results without speaking
+// mode "pause": after typing stops, speaks only a house number or postcode answer
+// mode "final": on Enter or after a voice result, always speaks
+function handleInput(text, mode) {
+  const q = text.trim();
+
+  if (!q) {
+    pending = null;
+    clearResults();
     return;
   }
 
-  if (pending && !live) {
+  if (pending) {
     const hits = answerPending(q);
     if (hits) {
-      showDuties(hits, true);
+      showDuties(hits, mode !== "live");
       return;
     }
+
+    const area = areaFromText(q);
+    if (area && mode === "final") {
+      setArea(area, true);
+      return;
+    }
+
+    // Still waiting for a house number or postcode
+    if (isNumberOrPostcode(q) || (q.length >= 3 && !looksLikeRoad(q))) {
+      if (mode === "final") {
+        askDetail(pending.matches, `No match for ${q}. Try another house number or postcode.`, true);
+      }
+      return;
+    }
+    pending = null;   // a different road name has been typed
   }
 
-  pending = null;
-  if (live && q.length < 3 && !findWalk(q).length) {
+  const area = areaFromText(q);
+  if (area) {
+    // Typing "ME9" switches only on Enter, so a half-typed postcode is not lost
+    if (mode === "final") setArea(area, true);
+    else clearResults();
+    return;
+  }
+
+  if (mode === "live" && q.length < 3 && !findWalk(q).length) {
     clearResults();
     return;
   }
-  lookup(q, !live);
+
+  lookup(q, mode === "final");
 }
 
 function lookup(q, speakIt) {
@@ -388,7 +662,17 @@ function lookup(q, speakIt) {
 
   const matches = findRoads(q);
   if (!matches.length) {
-    showDuties([], speakIt);
+    const elsewhere = findRoads(q, roads.filter(r => r.areaName !== selectedArea));
+    if (elsewhere.length) {
+      const otherArea = elsewhere[0].areaName;
+      showNote(`Not in ${selectedArea}. Found in ${otherArea}. Say or type ${otherArea} to switch.`);
+      if (speakIt) speak(`Not in ${AREA_SPOKEN[selectedArea]}. Found in ${AREA_SPOKEN[otherArea]}.`);
+      return;
+    }
+
+    const options = suggestRoads([q]);
+    if (options.length) showSuggestions(options, speakIt);
+    else showDuties([], speakIt);
     return;
   }
 
@@ -400,9 +684,13 @@ function lookup(q, speakIt) {
 }
 
 function handleVoice(alts) {
-  const spoken = alts.map(wordsToDigits);
+  // Number words become digits and letter codes are fixed, e.g. "you seventy" becomes U70
+  const spoken = alts.map(a => fixCodes(wordsToDigits(a)));
 
-  // An open question comes first, so "fifteen" answers "which house number?"
+  // A "did you mean" question comes first, so "yes" or "two" answers it
+  if (suggestions && handleSuggestionVoice(alts)) return;
+
+  // An open question about a house number or postcode comes next
   if (pending) {
     for (const s of spoken) {
       const hits = answerPending(s);
@@ -411,6 +699,15 @@ function handleVoice(alts) {
         showDuties(hits, true);
         return;
       }
+    }
+  }
+
+  // "ME nine" or "ME ten" switches area
+  for (const s of spoken) {
+    const area = areaFromText(s);
+    if (area) {
+      setArea(area, true);
+      return;
     }
   }
 
@@ -425,15 +722,33 @@ function handleVoice(alts) {
       showDuties(findWalk(m[2]), true);
     } else {
       switchMode("road");
-      showLetter(normalise(m[2])[0]);
+      showLetter(normalise(m[2])[0], true);
     }
     return;
   }
 
-  // Otherwise use the first alternative that matches something
-  const pick = spoken.find(s => findWalk(s).length || findRoads(s).length) || spoken[0];
-  input.value = pick;
-  handleInput(pick, false);
+  // An exact match, or the start of a road name, is used straight away
+  const direct = spoken.find(s => findRoads(s).length || findWalk(s).length);
+  if (direct) {
+    input.value = direct;
+    handleInput(direct, "final");
+    return;
+  }
+
+  // A house number or postcode while a question is open
+  const numeric = spoken.find(s => isNumberOrPostcode(s));
+  if (pending && numeric) {
+    input.value = numeric;
+    handleInput(numeric, "final");
+    return;
+  }
+
+  // Nothing matched exactly, so offer the closest names and wait for confirmation
+  pending = null;
+  input.value = spoken[0];
+  const options = suggestRoads(spoken);
+  if (options.length) showSuggestions(options, true);
+  else showDuties([], true);
 }
 
 function wordsToDigits(text) {
@@ -445,7 +760,7 @@ function wordsToDigits(text) {
       out.push(words[i]);
       continue;
     }
-    // "twenty one" -> 21
+    // "twenty one" becomes 21
     const next = NUMBER_WORDS[words[i + 1]];
     if (v >= 20 && next !== undefined && next > 0 && next < 10) {
       out.push(String(v + next));
@@ -463,16 +778,18 @@ function speak(text) {
   speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
   u.lang = "en-GB";
+  u.rate = SPEECH_RATE;
   speechSynthesis.speak(u);
 }
 
-// iOS only allows speech output after a tap, so start an empty utterance inside one
+// iOS only allows speech after a user tap, so an empty utterance is started inside the first one
 function unlockSpeech() {
-  if (!("speechSynthesis" in window)) return;
+  if (speechUnlocked || !("speechSynthesis" in window)) return;
+  speechUnlocked = true;
   speechSynthesis.speak(new SpeechSynthesisUtterance(""));
 }
 
-// "U070" -> "U 0 7 0" so each character is read separately
+// "U070" becomes "U 0 7 0" so each character is read separately
 function spokenCode(code) {
   return /^\d+$/.test(code) ? code : code.split("").join(" ");
 }
