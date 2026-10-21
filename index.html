@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#D40511">
+  <title>Sorting Assistant</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Sorting Assistant</h1>
+  </header>
+
+  <main>
+    <nav class="tabs">
+      <button id="roadTab" class="tab active" type="button">Road Lookup</button>
+      <button id="walkTab" class="tab" type="button">Duty Lookup</button>
+    </nav>
+
+    <section class="search">
+      <input id="roadSearch" type="search" autocomplete="off" autocapitalize="characters"
+             placeholder="Type or say a road name">
+      <button id="micBtn" type="button" class="mic">🎤 Speak</button>
+      <button id="resetBtn" type="button">Reset</button>
+    </section>
+    <p id="transcript" class="transcript" aria-live="polite"></p>
+
+    <div id="letterGrid" class="grid"></div>
+    <div id="walkGrid" class="grid hidden"></div>
+
+    <ul id="results"></ul>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
