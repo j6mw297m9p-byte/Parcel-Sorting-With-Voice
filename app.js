@@ -125,12 +125,9 @@ let audioCtx = null;
 let activeSources = [];
 const bufferCache = new Map();
 const roadLoose = new Map();
-let micStream = null;
-let micReadyToggle;
 
 const APP_VERSION = "Web Audio playback v1";
 const CLIP_GAP_SECONDS = 0.15;
-const MIC_READY_KEY = "sortingMicReady";
 
 // Page elements.
 let input;
@@ -330,27 +327,6 @@ function createControls() {
     )
   );
 
-  const readyLabel = document.createElement("label");
-  readyLabel.style.display = "block";
-  readyLabel.style.marginTop = "6px";
-
-  micReadyToggle = document.createElement("input");
-  micReadyToggle.type = "checkbox";
-  micReadyToggle.checked = readSetting(MIC_READY_KEY) === "true";
-  micReadyToggle.style.marginRight = "8px";
-
-  micReadyToggle.onchange = () => {
-    saveSetting(MIC_READY_KEY, String(micReadyToggle.checked));
-    setMicReady(micReadyToggle.checked);
-  };
-
-  readyLabel.append(
-    micReadyToggle,
-    document.createTextNode(
-      "Keep microphone ready (experimental, iPhone)"
-    )
-  );
-
   micStatus = document.createElement("p");
   micStatus.setAttribute("role", "status");
   micStatus.style.fontSize = "14px";
@@ -416,7 +392,6 @@ function createControls() {
   box.append(
     replayBtn,
     label,
-    readyLabel,
     micStatus,
     audioStatus,
     diagnosticButton,
@@ -978,33 +953,6 @@ async function playWithWebAudio(job, entries) {
   });
 }
 
-async function setMicReady(on) {
-  if (!on) {
-    if (micStream) {
-      micStream.getTracks().forEach(track => track.stop());
-      micStream = null;
-      logVoice("Microphone released.");
-    }
-
-    return;
-  }
-
-  if (micStream) return;
-
-  try {
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: true
-    });
-
-    logVoice("Microphone held open.");
-  } catch (error) {
-    logVoice(`Hold microphone failed: ${error.name}`);
-    setMicStatus(`Could not hold the microphone: ${error.name}`);
-
-    if (micReadyToggle) micReadyToggle.checked = false;
-    saveSetting(MIC_READY_KEY, "false");
-  }
-}
 
 async function playWithElement(job) {
   for (let index = 0; index < job.keys.length; index++) {
@@ -1315,14 +1263,6 @@ function setupRecognizer() {
     }
 
     unlockAudio();
-
-    if (
-      readSetting(MIC_READY_KEY) === "true" &&
-      !micStream &&
-      micState === "idle"
-    ) {
-      setMicReady(true);
-    }
 
     if (micState !== "idle") {
       enterTextMode(false);
