@@ -119,6 +119,19 @@ let playbackTimer = null;
 let autoTimer = null;
 let cancelCurrentClip = null;
 
+// Web Audio playback (avoids the <audio> element, which on iOS
+// reconfigures the audio session and can leave the microphone stuck).
+let audioCtx = null;
+let activeSources = [];
+const bufferCache = new Map();
+const roadLoose = new Map();
+let micStream = null;
+let micReadyToggle;
+
+const APP_VERSION = "Web Audio playback v1";
+const CLIP_GAP_SECONDS = 0.15;
+const MIC_READY_KEY = "sortingMicReady";
+
 // Page elements.
 let input;
 let micBtn;
@@ -258,8 +271,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   micBtn.disabled = !ready || !recognizer;
 
   logVoice(
-    "Reusable recogniser trial loaded. " +
-    "One recognition object is used for all searches."
+    `${APP_VERSION} loaded. AudioContext: ` +
+    `${window.AudioContext || window.webkitAudioContext ? "yes" : "no"}` +
+    `, audioSession: ${navigator.audioSession ? "yes" : "no"}.`
   );
 });
 
@@ -279,6 +293,8 @@ function createControls() {
 
   replayBtn.onclick = () => {
     if (!lastReply) return;
+
+    unlockAudio();
 
     const keys = [...lastReply.keys];
     enterTextMode(false);
@@ -311,6 +327,27 @@ function createControls() {
     autoToggle,
     document.createTextNode(
       "Listen automatically after voice questions"
+    )
+  );
+
+  const readyLabel = document.createElement("label");
+  readyLabel.style.display = "block";
+  readyLabel.style.marginTop = "6px";
+
+  micReadyToggle = document.createElement("input");
+  micReadyToggle.type = "checkbox";
+  micReadyToggle.checked = readSetting(MIC_READY_KEY) === "true";
+  micReadyToggle.style.marginRight = "8px";
+
+  micReadyToggle.onchange = () => {
+    saveSetting(MIC_READY_KEY, String(micReadyToggle.checked));
+    setMicReady(micReadyToggle.checked);
+  };
+
+  readyLabel.append(
+    micReadyToggle,
+    document.createTextNode(
+      "Keep microphone ready (experimental, iPhone)"
     )
   );
 
@@ -379,6 +416,7 @@ function createControls() {
   box.append(
     replayBtn,
     label,
+    readyLabel,
     micStatus,
     audioStatus,
     diagnosticButton,
@@ -440,8 +478,28 @@ function clipKey(value) {
   return compactSpaces(value).toUpperCase();
 }
 
+function looseRoad(text) {
+  return String(text).toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
 function recording(key) {
-  return manifest.get(clipKey(key));
+  const normal = clipKey(key);
+  const direct = manifest.get(normal);
+  if (direct) return direct;
+
+  // Road clips: tolerate area or punctuation differences between
+  // roads.csv, the generator script and this app.
+  const match = normal.match(/^ROAD:(?:ME9|ME10):(.*)$/);
+
+  if (match) {
+    const other = normal.startsWith("ROAD:ME9:") ? "ME10" : "ME9";
+    const swapped = manifest.get(`ROAD:${other}:${match[1]}`);
+    if (swapped) return swapped;
+
+    return roadLoose.get(looseRoad(match[1]));
+  }
+
+  return undefined;
 }
 
 function roadRecordingKey(entry) {
@@ -486,10 +544,17 @@ async function loadManifest() {
         continue;
       }
 
-      manifest.set(clipKey(key), {
-        text: entry.text,
-        url: url.href
-      });
+      const stored = { text: entry.text, url: url.href };
+      const normal = clipKey(key);
+
+      manifest.set(normal, stored);
+
+      const roadMatch = normal.match(/^ROAD:(?:ME9|ME10):(.*)$/);
+
+      if (roadMatch) {
+        const loose = looseRoad(roadMatch[1]);
+        if (!roadLoose.has(loose)) roadLoose.set(loose, stored);
+      }
     }
 
     if (!manifest.size) {
@@ -499,7 +564,25 @@ async function loadManifest() {
     manifestReady = true;
     updateReplayButton();
 
-    logVoice(`Manifest loaded: ${manifest.size} entries.`);
+    let roadCount = 0;
+    let dutyCount = 0;
+
+    for (const key of manifest.keys()) {
+      if (key.startsWith("ROAD:")) roadCount++;
+      if (key.startsWith("DUTY:")) dutyCount++;
+    }
+
+    logVoice(
+      `Manifest loaded: ${manifest.size} entries ` +
+      `(${roadCount} road, ${dutyCount} duty).`
+    );
+
+    if (!roadCount) {
+      setAudioStatus(
+        "audio/manifest.json has no road: entries, so road names " +
+        "cannot be read. Check the manifest was uploaded."
+      );
+    }
   } catch (error) {
     console.error(error);
 
@@ -595,20 +678,32 @@ function requestPlayback(keys, listenAfter) {
   }
 
   const missing = keys.filter(key => !recording(key));
+  let notice = "";
 
   if (missing.length) {
-    setAudioStatus(
-      `Missing recording: ${missing[0]}. ` +
-      "Upload the new MP3s and updated manifest."
+    logVoice(
+      `Missing ${missing.length} recording(s): ` +
+      missing.slice(0, 3).join(" | ")
     );
 
-    logVoice(`Missing recording: ${missing[0]}`);
-    return;
+    keys = keys.filter(key => recording(key));
+
+    if (!keys.length) {
+      setAudioStatus(`Missing recording: ${missing[0]}`);
+      return;
+    }
+
+    const roads = missing.filter(key => /^road:/i.test(key)).length;
+
+    notice = roads
+      ? `${roads} road name(s) had no recording and were skipped.`
+      : `${missing.length} recording(s) were missing.`;
   }
 
   queuedReply = {
     keys: [...keys],
     listenAfter,
+    notice,
     version: playbackVersion
   };
 
@@ -656,35 +751,34 @@ async function runPlayback(job) {
   logVoice(`Playback requested: ${job.keys.length} clip(s).`);
 
   try {
-    for (let index = 0; index < job.keys.length; index++) {
-      if (
-        job.version !== playbackVersion ||
-        document.hidden ||
-        micState !== "idle"
-      ) {
-        return;
+    const entries = job.keys.map(key => recording(key));
+    let finished = false;
+
+    if (audioCtx) {
+      try {
+        const completed = await playWithWebAudio(job, entries);
+        finished = true;
+
+        if (!completed || job.version !== playbackVersion) return;
+      } catch (error) {
+        if (job.version !== playbackVersion) return;
+
+        logVoice(
+          `Web Audio failed (${error.name}: ${error.message}); ` +
+          "trying the audio element."
+        );
       }
+    }
 
-      const entry = recording(job.keys[index]);
-      const next = recording(job.keys[index + 1] || "");
-
-      if (next) {
-        // Best-effort browser preloading.
-        nextAudio.src = next.url;
-        nextAudio.load();
-      }
-
-      const completed = await playClip(entry);
-
-      if (!completed || job.version !== playbackVersion) {
-        return;
-      }
+    if (!finished) {
+      const completed = await playWithElement(job);
+      if (!completed) return;
     }
 
     if (job.version !== playbackVersion) return;
 
     playbackActive = false;
-    setAudioStatus("");
+    setAudioStatus(job.notice || "");
     logVoice("Playback ended.");
 
     if (
@@ -725,6 +819,220 @@ async function runPlayback(job) {
       playbackActive = false;
     }
   }
+}
+
+// ============================================================
+// Web Audio playback
+// ============================================================
+
+function unlockAudio() {
+  // Must run synchronously inside a tap handler.
+  try {
+    const Context = window.AudioContext || window.webkitAudioContext;
+    if (!Context) return;
+
+    if (!audioCtx) {
+      audioCtx = new Context();
+      logVoice("Audio context created.");
+    }
+
+    if (audioCtx.state !== "running") {
+      const resumed = audioCtx.resume();
+      if (resumed && resumed.catch) resumed.catch(() => {});
+    }
+
+    // Silent blip, which also unlocks output on iOS.
+    const blip = audioCtx.createBufferSource();
+    blip.buffer = audioCtx.createBuffer(1, 1, 22050);
+    blip.connect(audioCtx.destination);
+    blip.start(0);
+  } catch (error) {
+    logVoice(`Audio unlock failed: ${error.name}: ${error.message}`);
+  }
+}
+
+async function loadBuffer(entry) {
+  if (bufferCache.has(entry.url)) return bufferCache.get(entry.url);
+
+  const response = await fetch(entry.url);
+
+  if (!response.ok) {
+    throw new Error(`Clip download failed: HTTP ${response.status}`);
+  }
+
+  const data = await response.arrayBuffer();
+
+  const buffer = await new Promise((resolve, reject) => {
+    const promise = audioCtx.decodeAudioData(data, resolve, reject);
+    if (promise && promise.catch) promise.catch(reject);
+  });
+
+  bufferCache.set(entry.url, buffer);
+  return buffer;
+}
+
+// Skips silence at the start and end of each recording so the
+// road name and duty join closely.
+function audibleRange(buffer) {
+  const data = buffer.getChannelData(0);
+  const threshold = 0.01;
+  let start = 0;
+  let end = data.length - 1;
+
+  while (start < end && Math.abs(data[start]) < threshold) start++;
+  while (end > start && Math.abs(data[end]) < threshold) end--;
+
+  const pad = Math.floor(buffer.sampleRate * 0.03);
+  start = Math.max(0, start - pad);
+  end = Math.min(data.length - 1, end + pad);
+
+  return {
+    offset: start / buffer.sampleRate,
+    duration: (end - start + 1) / buffer.sampleRate
+  };
+}
+
+function stopSources() {
+  const sources = activeSources;
+  activeSources = [];
+
+  sources.forEach(source => {
+    try {
+      source.onended = null;
+      source.stop();
+    } catch (error) {
+      // Already stopped.
+    }
+  });
+}
+
+async function playWithWebAudio(job, entries) {
+  if (audioCtx.state !== "running") {
+    try {
+      await audioCtx.resume();
+    } catch (error) {
+      logVoice(`Audio resume failed: ${error.name}`);
+    }
+  }
+
+  logVoice(`Audio context state: ${audioCtx.state}`);
+
+  if (audioCtx.state !== "running") {
+    throw new Error(`Audio context is ${audioCtx.state}`);
+  }
+
+  setAudioStatus("Loading recordings...");
+
+  const buffers = [];
+
+  for (const entry of entries) {
+    buffers.push(await loadBuffer(entry));
+
+    if (job.version !== playbackVersion) return false;
+  }
+
+  if (job.version !== playbackVersion) return false;
+
+  setAudioStatus(`Playing: ${entries.map(e => e.text).join(" ")}`);
+
+  return new Promise(resolve => {
+    let when = audioCtx.currentTime + 0.05;
+    let finished = false;
+    let timer;
+
+    function done(completed) {
+      if (finished) return;
+      finished = true;
+
+      clearTimeout(timer);
+      cancelCurrentClip = null;
+      activeSources = [];
+      resolve(completed);
+    }
+
+    cancelCurrentClip = () => {
+      stopSources();
+      done(false);
+    };
+
+    buffers.forEach((buffer, index) => {
+      const range = audibleRange(buffer);
+      const source = audioCtx.createBufferSource();
+
+      source.buffer = buffer;
+      source.connect(audioCtx.destination);
+      source.start(when, range.offset, range.duration);
+
+      if (index === buffers.length - 1) {
+        source.onended = () => done(true);
+      }
+
+      activeSources.push(source);
+      when += range.duration + CLIP_GAP_SECONDS;
+    });
+
+    timer = setTimeout(() => {
+      stopSources();
+      done(true);
+    }, (when - audioCtx.currentTime + 3) * 1000);
+  });
+}
+
+async function setMicReady(on) {
+  if (!on) {
+    if (micStream) {
+      micStream.getTracks().forEach(track => track.stop());
+      micStream = null;
+      logVoice("Microphone released.");
+    }
+
+    return;
+  }
+
+  if (micStream) return;
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: true
+    });
+
+    logVoice("Microphone held open.");
+  } catch (error) {
+    logVoice(`Hold microphone failed: ${error.name}`);
+    setMicStatus(`Could not hold the microphone: ${error.name}`);
+
+    if (micReadyToggle) micReadyToggle.checked = false;
+    saveSetting(MIC_READY_KEY, "false");
+  }
+}
+
+async function playWithElement(job) {
+  for (let index = 0; index < job.keys.length; index++) {
+    if (
+      job.version !== playbackVersion ||
+      document.hidden ||
+      micState !== "idle"
+    ) {
+      return false;
+    }
+
+    const entry = recording(job.keys[index]);
+    const next = recording(job.keys[index + 1] || "");
+
+    if (next) {
+      // Best-effort browser preloading.
+      nextAudio.src = next.url;
+      nextAudio.load();
+    }
+
+    const completed = await playClip(entry);
+
+    if (!completed || job.version !== playbackVersion) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function playClip(entry) {
@@ -792,7 +1100,7 @@ function updateMicButton() {
   } else if (micState === "listening") {
     micBtn.textContent = "Stop listening";
   } else if (micState === "blocked") {
-    micBtn.textContent = "Microphone stuck — reload";
+    micBtn.textContent = "Microphone stuck — tap to reload";
   } else {
     micBtn.textContent = "Stopping...";
   }
@@ -1001,11 +1309,19 @@ function setupRecognizer() {
 
   micBtn.onclick = () => {
     if (micState === "blocked") {
-      setMicStatus(
-        "Safari has not ended the old recognition session. " +
-        "Reload this page before trying again."
-      );
+      logVoice("Reloading because recognition is stuck.");
+      location.reload();
       return;
+    }
+
+    unlockAudio();
+
+    if (
+      readSetting(MIC_READY_KEY) === "true" &&
+      !micStream &&
+      micState === "idle"
+    ) {
+      setMicReady(true);
     }
 
     if (micState !== "idle") {
