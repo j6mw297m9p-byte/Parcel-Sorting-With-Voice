@@ -8,8 +8,8 @@ const PAUSE_MS = 900;
 const SPEECH_RATE = 1;
 const MIN_SUGGEST = 0.6;
 const AREA_KEY = "sortingArea";
+const AUTO_LISTEN_KEY = "sortingAutoListen";
 
-// This delay happens AFTER recognition reports that it ended.
 const AUDIO_HANDOVER_MS = 600;
 const MIC_STOP_WARNING_MS = 6000;
 
@@ -112,6 +112,10 @@ let pending = null;
 let suggestions = null;
 let typingTimer = null;
 
+// Text mode NEVER automatically speaks.
+// Only microphone input switches this to voice mode.
+let interactionMode = "text";
+
 // Microphone states:
 // idle -> starting -> listening -> stopping -> idle
 let micState = "idle";
@@ -121,7 +125,7 @@ let micReleasedAt = 0;
 
 // Speech output.
 let queuedReply = null;
-let lastReply = null;
+let lastReply = "";
 let currentUtterance = null;
 let speechVersion = 0;
 let speechStartTimer = null;
@@ -142,7 +146,7 @@ let micBtn;
 let transcriptEl;
 let resetBtn;
 
-// Extra controls are created by JavaScript.
+// Extra controls created by JavaScript.
 let replayBtn;
 let audioStatus;
 let autoListenToggle;
@@ -167,22 +171,43 @@ document.addEventListener("DOMContentLoaded", () => {
 
   createAudioControls();
 
-  roadTab.onclick = () => switchMode("road");
-  walkTab.onclick = () => switchMode("walk");
+  roadTab.onclick = () => {
+    beginTextInteraction();
+    switchMode("road");
+  };
 
-  me10Tab.onclick = () => setArea("ME10", false);
-  me9Tab.onclick = () => setArea("ME9", false);
+  walkTab.onclick = () => {
+    beginTextInteraction();
+    switchMode("walk");
+  };
+
+  me10Tab.onclick = () => {
+    beginTextInteraction();
+    setArea("ME10");
+  };
+
+  me9Tab.onclick = () => {
+    beginTextInteraction();
+    setArea("ME9");
+  };
 
   resetBtn.onclick = reset;
 
+  // Focusing the text field also ends the voice interaction.
+  input.addEventListener("focus", () => {
+    beginTextInteraction(false);
+  });
+
   input.addEventListener("input", () => {
-    clearTimeout(typingTimer);
-    stopInteraction();
+    beginTextInteraction();
 
     handleInput(input.value, "live");
 
     if (pending && isNumberOrPostcode(input.value)) {
       typingTimer = setTimeout(() => {
+        typingTimer = null;
+
+        // This remains a silent text interaction.
         handleInput(input.value, "pause");
       }, PAUSE_MS);
     }
@@ -192,7 +217,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (event.key !== "Enter") return;
 
     event.preventDefault();
-    clearTimeout(typingTimer);
+    beginTextInteraction();
     handleInput(input.value, "final");
   });
 
@@ -202,13 +227,12 @@ document.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) return;
 
-    clearTimeout(typingTimer);
-    stopInteraction();
+    beginTextInteraction(false);
     setAudioStatus("Paused. Tap Speak when you return.");
   });
 
   window.addEventListener("pagehide", () => {
-    stopInteraction();
+    beginTextInteraction(false);
   });
 });
 
@@ -220,17 +244,21 @@ function createAudioControls() {
   replayBtn.type = "button";
   replayBtn.textContent = "Read reply aloud";
   replayBtn.disabled = true;
-  replayBtn.style.padding = "10px 12px";
-  replayBtn.style.fontSize = "16px";
+
+  Object.assign(replayBtn.style, {
+    padding: "10px 12px",
+    fontSize: "16px"
+  });
 
   replayBtn.onclick = () => {
     if (!lastReply) return;
 
-    const reply = lastReply;
+    const text = lastReply;
 
-    // If the mic is idle, playback is requested directly
-    // from this tap. Otherwise we must wait for mic onend.
-    speak(reply.text, reply.onDone);
+    // Explicit playback is allowed even in silent text mode.
+    // It does NOT automatically restart the microphone.
+    beginTextInteraction(false);
+    speak(text);
   };
 
   const label = document.createElement("label");
@@ -239,36 +267,112 @@ function createAudioControls() {
 
   autoListenToggle = document.createElement("input");
   autoListenToggle.type = "checkbox";
-  autoListenToggle.checked = true;
+  autoListenToggle.checked =
+    readPreference(AUTO_LISTEN_KEY) !== "false";
   autoListenToggle.style.marginRight = "8px";
+
+  autoListenToggle.addEventListener("change", () => {
+    writePreference(
+      AUTO_LISTEN_KEY,
+      String(autoListenToggle.checked)
+    );
+
+    if (!autoListenToggle.checked) {
+      clearTimeout(followUpTimer);
+      followUpTimer = null;
+    }
+  });
 
   label.append(
     autoListenToggle,
     document.createTextNode(
-      "Listen automatically after spoken questions"
+      "Listen automatically after voice questions"
     )
   );
 
   audioStatus = document.createElement("p");
   audioStatus.setAttribute("role", "status");
   audioStatus.setAttribute("aria-live", "polite");
-  audioStatus.style.fontSize = "14px";
-  audioStatus.style.margin = "8px 0";
 
-  controls.append(replayBtn, label, audioStatus);
+  Object.assign(audioStatus.style, {
+    fontSize: "14px",
+    margin: "8px 0"
+  });
 
+  const version = document.createElement("small");
+  version.textContent =
+    "Silent typing version 1.0 — typed searches do not speak.";
+  version.style.display = "block";
+
+  controls.append(replayBtn, label, audioStatus, version);
   transcriptEl.insertAdjacentElement("afterend", controls);
-
-  if (!synth) {
-    setAudioStatus(
-      "This browser does not support built-in spoken replies."
-    );
-  }
 }
 
 function setAudioStatus(message) {
   if (audioStatus) {
     audioStatus.textContent = message;
+  }
+}
+
+function readPreference(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch (error) {
+    return null;
+  }
+}
+
+function writePreference(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (error) {
+    // Preferences are optional.
+  }
+}
+
+// ============================================================
+// Interaction modes
+// ============================================================
+
+function beginTextInteraction(forgetReply = true) {
+  interactionMode = "text";
+
+  clearTimeout(typingTimer);
+  typingTimer = null;
+
+  cancelSpeech(forgetReply);
+  requestRecognitionStop(true);
+
+  if (transcriptEl) {
+    transcriptEl.textContent = "";
+  }
+
+  setAudioStatus("");
+}
+
+function beginVoiceInteraction() {
+  clearTimeout(typingTimer);
+  typingTimer = null;
+
+  cancelSpeech(true);
+  interactionMode = "voice";
+}
+
+// Every result can have a readable reply, but only voice
+// interactions automatically send it to speech synthesis.
+function respond(text, onDone) {
+  rememberReply(text);
+
+  if (interactionMode === "voice") {
+    speak(text, onDone);
+  }
+}
+
+function rememberReply(text) {
+  lastReply = String(text || "").trim();
+
+  if (replayBtn) {
+    replayBtn.disabled = !synth || !lastReply;
   }
 }
 
@@ -294,7 +398,10 @@ async function loadData() {
     }
 
     dataReady = true;
-    applyArea(savedArea() || "ME10");
+
+    const saved = readPreference(AREA_KEY);
+    applyArea(saved === "ME9" ? "ME9" : "ME10");
+
     buildGrids();
     switchMode("road");
 
@@ -328,8 +435,7 @@ function parseCsv(text) {
     const road = (columns[0] || "").trim();
 
     if (!road) {
-      // Your existing file separates ME10 and ME9
-      // with blank rows.
+      // Your file separates ME10 and ME9 with blank rows.
       if (entries.length && areaName === "ME10") {
         areaName = "ME9";
       }
@@ -440,9 +546,6 @@ function makeEntry(road, walk, letter, areaName) {
     }
   }
 
-  // Two ranges generally represent the two sides of a road.
-  // Use the range's first number rather than assuming
-  // the first range is always odd.
   if (ranges.length === 2 && singles.length === 0) {
     for (const range of ranges) {
       if (!range.parity) {
@@ -828,26 +931,6 @@ function areaFromText(text) {
     : null;
 }
 
-function savedArea() {
-  try {
-    const value = localStorage.getItem(AREA_KEY);
-
-    return value === "ME10" || value === "ME9"
-      ? value
-      : null;
-  } catch (error) {
-    return null;
-  }
-}
-
-function rememberArea(name) {
-  try {
-    localStorage.setItem(AREA_KEY, name);
-  } catch (error) {
-    // The app can still work without saved preferences.
-  }
-}
-
 function applyArea(name) {
   selectedArea = name;
 
@@ -856,14 +939,14 @@ function applyArea(name) {
   areaLabel.textContent = name;
 }
 
-function setArea(name, speakIt) {
+function setArea(name) {
   if (!dataReady) return;
 
-  stopInteraction();
   clearTimeout(typingTimer);
+  cancelSpeech(true);
 
   applyArea(name);
-  rememberArea(name);
+  writePreference(AREA_KEY, name);
 
   pending = null;
   suggestions = null;
@@ -873,7 +956,7 @@ function setArea(name, speakIt) {
   const query = input.value.trim();
 
   if (query && !areaFromText(query)) {
-    handleInput(query, speakIt ? "final" : "live");
+    handleInput(query, "final");
     return;
   }
 
@@ -881,10 +964,7 @@ function setArea(name, speakIt) {
   clearResults();
 
   showNote(`Showing ${name}. Type or say a road name.`);
-
-  if (speakIt) {
-    speak(`Showing ${AREA_SPOKEN[name]}.`, listenAuto);
-  }
+  respond(`Showing ${AREA_SPOKEN[name]}.`, listenAuto);
 }
 
 // ============================================================
@@ -905,7 +985,7 @@ function buildGrids() {
 
   letters.forEach(letter => {
     addButton(letterGrid, letter, () => {
-      stopInteraction();
+      beginTextInteraction();
       showLetter(letter);
     });
   });
@@ -922,7 +1002,7 @@ function buildGrids() {
 
   walks.forEach(walk => {
     addButton(walkGrid, walk, () => {
-      stopInteraction();
+      beginTextInteraction();
       showByWalk(walk);
     });
   });
@@ -937,9 +1017,6 @@ function addButton(parent, label, onClick) {
 }
 
 function switchMode(mode) {
-  stopInteraction();
-  clearTimeout(typingTimer);
-
   const isRoad = mode === "road";
   pending = null;
 
@@ -962,46 +1039,43 @@ function clearResults() {
 
   letterGrid.classList.remove("compact");
   walkGrid.classList.remove("compact");
+
+  rememberReply("");
 }
 
 function reset() {
-  clearTimeout(typingTimer);
-  stopInteraction();
+  beginTextInteraction();
 
   pending = null;
   suggestions = null;
   input.value = "";
-  transcriptEl.textContent = "";
 
   clearResults();
-  setAudioStatus("");
 }
 
 // ============================================================
 // Results and prompts
 // ============================================================
 
-function showLetter(letter, speakIt = false) {
+function showLetter(letter) {
   pending = null;
 
   showDuties(
-    areaRoads().filter(entry => entry.letter === letter),
-    speakIt
+    areaRoads().filter(entry => entry.letter === letter)
   );
 }
 
-function showByWalk(key, speakIt = false) {
+function showByWalk(key) {
   pending = null;
 
   showDuties(
     areaRoads().filter(
       entry => walkKey(entry.walk) === key
-    ),
-    speakIt
+    )
   );
 }
 
-function showDuties(matches, speakIt) {
+function showDuties(matches) {
   pending = null;
   suggestions = null;
   compactGrids();
@@ -1019,7 +1093,22 @@ function showDuties(matches, speakIt) {
       });
   }
 
-  if (speakIt) speakDuties(matches);
+  respond(dutyMessage(matches));
+}
+
+function dutyMessage(matches) {
+  if (!matches.length) {
+    return "No road found.";
+  }
+
+  if (matches.length > 5) {
+    return `${matches.length} entries. See the screen.`;
+  }
+
+  return matches.map(
+    entry =>
+      `${entry.base}, duty ${displayWalk(entry.walk)}`
+  ).join(". ");
 }
 
 function resultRow(entry) {
@@ -1058,6 +1147,8 @@ function showNote(text) {
   suggestions = null;
   results.innerHTML = "";
   results.appendChild(makeNote(text));
+
+  rememberReply(text);
 }
 
 function optionRow(label, onClick, dashed = false) {
@@ -1078,10 +1169,13 @@ function optionRow(label, onClick, dashed = false) {
     borderRadius: "8px"
   });
 
-  if (dashed) button.style.borderStyle = "dashed";
+  if (dashed) {
+    button.style.borderStyle = "dashed";
+  }
 
   button.onclick = () => {
-    stopInteraction();
+    // Tapping a result is always silent.
+    beginTextInteraction();
     onClick();
   };
 
@@ -1089,32 +1183,33 @@ function optionRow(label, onClick, dashed = false) {
   return row;
 }
 
-function askDetail(matches, message, speakIt) {
+function askDetail(matches, message) {
   pending = { matches };
   compactGrids();
   showNote(message);
 
-  if (speakIt) speak(message, listenAuto);
+  respond(message, listenAuto);
 }
 
 // ============================================================
 // "Did you mean" choices and confirmation
 // ============================================================
 
-function offerOptions(options, speakIt) {
+function offerOptions(options) {
   suggestions = {
     options,
     stage: "choose",
     chosen: -1
   };
 
-  renderChoose(speakIt);
+  renderChoose();
 }
 
-function renderChoose(speakIt) {
+function renderChoose() {
   if (!suggestions) return;
 
   const options = suggestions.options;
+
   compactGrids();
   results.innerHTML = "";
 
@@ -1140,12 +1235,10 @@ function renderChoose(speakIt) {
     optionRow("None of these", cancelSuggestions, true)
   );
 
-  if (speakIt) {
-    speak(choosePrompt(options), listenAuto);
-  }
+  respond(choosePrompt(options), listenAuto);
 }
 
-function renderConfirm(speakIt) {
+function renderConfirm() {
   if (!suggestions) return;
 
   const index = suggestions.chosen;
@@ -1170,9 +1263,7 @@ function renderConfirm(speakIt) {
     optionRow("No, choose again", backToChoose, true)
   );
 
-  if (speakIt) {
-    speak(confirmPrompt(index), listenAuto);
-  }
+  respond(confirmPrompt(index), listenAuto);
 }
 
 function choosePrompt(options) {
@@ -1219,7 +1310,8 @@ function pickOption(index) {
 
   suggestions.stage = "confirm";
   suggestions.chosen = index;
-  renderConfirm(true);
+
+  renderConfirm();
 }
 
 function backToChoose() {
@@ -1228,7 +1320,7 @@ function backToChoose() {
   suggestions.stage = "choose";
   suggestions.chosen = -1;
 
-  renderChoose(true);
+  renderChoose();
 }
 
 function acceptOption(index) {
@@ -1241,7 +1333,7 @@ function acceptOption(index) {
   suggestions = null;
   input.value = option.base;
 
-  lookup(option.base, true);
+  lookup(option.base);
 }
 
 function cancelSuggestions() {
@@ -1250,10 +1342,10 @@ function cancelSuggestions() {
   input.value = "";
 
   showNote("Okay. Say or type the road name again.");
-  speak("Okay. Say the road again.", listenAuto);
+  respond("Okay. Say the road again.", listenAuto);
 }
 
-function handleSuggestionVoice(alternatives) {
+function handleSuggestionAnswer(alternatives) {
   if (!suggestions) return false;
 
   const { options, stage, chosen } = suggestions;
@@ -1281,7 +1373,7 @@ function handleSuggestionVoice(alternatives) {
         if (options.length === 1) {
           acceptOption(0);
         } else {
-          speak(
+          respond(
             "Say the number of the road you want.",
             listenAuto
           );
@@ -1334,9 +1426,19 @@ function handleInput(text, mode) {
   }
 
   if (suggestions) {
-    if (mode !== "final") return;
+    // Preserve the choices while typing an answer.
+    // Enter submits that answer.
+    if (mode !== "final") {
+      rememberReply(
+        suggestions.stage === "confirm"
+          ? confirmPrompt(suggestions.chosen)
+          : choosePrompt(suggestions.options)
+      );
 
-    if (handleSuggestionVoice([query])) return;
+      return;
+    }
+
+    if (handleSuggestionAnswer([query])) return;
     suggestions = null;
   }
 
@@ -1344,7 +1446,17 @@ function handleInput(text, mode) {
     const hits = answerPending(query);
 
     if (hits) {
-      showDuties(hits, mode !== "live");
+      // During live typing, retain the original candidates.
+      // This prevents a partial house number permanently
+      // replacing the open detail question.
+      const openQuestion = pending;
+
+      showDuties(hits);
+
+      if (mode === "live") {
+        pending = openQuestion;
+      }
+
       return;
     }
 
@@ -1352,7 +1464,7 @@ function handleInput(text, mode) {
 
     if (area && mode === "final") {
       input.value = area;
-      setArea(area, true);
+      setArea(area);
       return;
     }
 
@@ -1360,12 +1472,15 @@ function handleInput(text, mode) {
       isNumberOrPostcode(query) ||
       (query.length >= 3 && !looksLikeRoad(query))
     ) {
-      if (mode === "final") {
+      if (mode === "final" || mode === "pause") {
         askDetail(
           pending.matches,
           `No match for ${query}. ` +
-          "Try another house number or postcode.",
-          true
+          "Try another house number or postcode."
+        );
+      } else {
+        rememberReply(
+          "Which house number or postcode?"
         );
       }
 
@@ -1379,7 +1494,7 @@ function handleInput(text, mode) {
 
   if (area) {
     if (mode === "final") {
-      setArea(area, true);
+      setArea(area);
     } else {
       clearResults();
     }
@@ -1396,14 +1511,14 @@ function handleInput(text, mode) {
     return;
   }
 
-  lookup(query, mode === "final");
+  lookup(query);
 }
 
-function lookup(query, speakIt) {
+function lookup(query) {
   const walkHits = findWalk(query);
 
   if (walkHits.length) {
-    showDuties(walkHits, speakIt);
+    showDuties(walkHits);
     return;
   }
 
@@ -1425,14 +1540,12 @@ function lookup(query, speakIt) {
         `Say or type ${otherArea} to switch.`
       );
 
-      if (speakIt) {
-        speak(
-          `Not in ${AREA_SPOKEN[selectedArea]}. ` +
-          `Found in ${AREA_SPOKEN[otherArea]}. ` +
-          `Say ${AREA_SPOKEN[otherArea]} to switch.`,
-          listenAuto
-        );
-      }
+      respond(
+        `Not in ${AREA_SPOKEN[selectedArea]}. ` +
+        `Found in ${AREA_SPOKEN[otherArea]}. ` +
+        `Say ${AREA_SPOKEN[otherArea]} to switch.`,
+        listenAuto
+      );
 
       return;
     }
@@ -1440,9 +1553,9 @@ function lookup(query, speakIt) {
     const options = suggestRoads([query]);
 
     if (options.length) {
-      offerOptions(options, speakIt);
+      offerOptions(options);
     } else {
-      showDuties([], speakIt);
+      showDuties([]);
     }
 
     return;
@@ -1452,14 +1565,13 @@ function lookup(query, speakIt) {
     askDetail(
       matches,
       `${matches[0].base} has ${matches.length} entries. ` +
-      "Which house number or postcode?",
-      speakIt
+      "Which house number or postcode?"
     );
 
     return;
   }
 
-  showDuties(matches, speakIt);
+  showDuties(matches);
 }
 
 // ============================================================
@@ -1467,11 +1579,17 @@ function lookup(query, speakIt) {
 // ============================================================
 
 function handleVoice(alternatives) {
-  if (!dataReady || !alternatives.length) return;
+  if (
+    !dataReady ||
+    !alternatives.length ||
+    interactionMode !== "voice"
+  ) {
+    return;
+  }
 
   if (
     suggestions &&
-    handleSuggestionVoice(alternatives)
+    handleSuggestionAnswer(alternatives)
   ) {
     return;
   }
@@ -1482,13 +1600,12 @@ function handleVoice(alternatives) {
     value => fixCodes(heardAsNumber(value))
   );
 
-  // Area commands take precedence over pending detail answers.
   for (const value of spoken) {
     const area = areaFromText(value);
 
     if (area) {
       input.value = area;
-      setArea(area, true);
+      setArea(area);
       return;
     }
   }
@@ -1499,7 +1616,7 @@ function handleVoice(alternatives) {
 
       if (hits) {
         input.value = value;
-        showDuties(hits, true);
+        showDuties(hits);
         return;
       }
     }
@@ -1515,10 +1632,10 @@ function handleVoice(alternatives) {
     if (command[1].toLowerCase() === "walk") {
       switchMode("walk");
       input.value = command[2];
-      showDuties(findWalk(command[2]), true);
+      showDuties(findWalk(command[2]));
     } else {
       switchMode("road");
-      showLetter(normalise(command[2])[0], true);
+      showLetter(normalise(command[2])[0]);
     }
 
     return;
@@ -1548,12 +1665,12 @@ function handleVoice(alternatives) {
   const options = suggestRoads(alternatives);
 
   if (options.length) {
-    offerOptions(options, true);
+    offerOptions(options);
     return;
   }
 
   showNote("No road found. Tap Speak to try again.");
-  speak("No road found. Say the road again.", listenAuto);
+  respond("No road found. Say the road again.", listenAuto);
 }
 
 // ============================================================
@@ -1577,25 +1694,13 @@ function cancelSpeech(forgetReply = false) {
   queuedReply = null;
   currentUtterance = null;
 
-  if (synth) {
+  if (synth && (synth.speaking || synth.pending)) {
     synth.cancel();
   }
 
   if (forgetReply) {
-    lastReply = null;
-
-    if (replayBtn) {
-      replayBtn.disabled = true;
-    }
+    rememberReply("");
   }
-}
-
-function stopInteraction() {
-  cancelSpeech(true);
-
-  // Abort discards any late recognition result from an
-  // interaction the user has deliberately left.
-  requestRecognitionStop(true);
 }
 
 function speak(text, onDone) {
@@ -1608,25 +1713,22 @@ function speak(text, onDone) {
   );
 
   cancelSpeech();
-
-  const reply = {
-    text,
-    onDone,
-    version: speechVersion,
-    notBefore: wasSpeaking ? Date.now() + 150 : 0
-  };
-
-  lastReply = { text, onDone };
-  replayBtn.disabled = !synth;
+  rememberReply(text);
 
   if (!synth) {
     setAudioStatus(
       "Spoken replies are not supported in this browser."
     );
+
     return;
   }
 
-  queuedReply = reply;
+  queuedReply = {
+    text,
+    onDone,
+    version: speechVersion,
+    notBefore: wasSpeaking ? Date.now() + 150 : 0
+  };
 
   if (micState !== "idle") {
     setAudioStatus("Stopping microphone before reading reply...");
@@ -1664,10 +1766,7 @@ function flushSpeech() {
   const remaining = earliestStart - Date.now();
 
   if (remaining > 0) {
-    speechStartTimer = setTimeout(
-      flushSpeech,
-      remaining
-    );
+    speechStartTimer = setTimeout(flushSpeech, remaining);
     return;
   }
 
@@ -1689,9 +1788,7 @@ function playSpeech(reply) {
   utterance.lang = "en-GB";
   utterance.rate = SPEECH_RATE;
 
-  const voices = synth.getVoices();
-
-  const britishVoice = voices.find(
+  const britishVoice = synth.getVoices().find(
     voice => voice.lang.toLowerCase() === "en-gb"
   );
 
@@ -1715,7 +1812,6 @@ function playSpeech(reply) {
     speechWatchdog = null;
     currentUtterance = null;
 
-    // Do not automatically restart listening after failure.
     setAudioStatus(
       `${message} Tap Read reply aloud to retry.`
     );
@@ -1742,6 +1838,7 @@ function playSpeech(reply) {
 
         if (
           reply.version === speechVersion &&
+          interactionMode === "voice" &&
           !document.hidden &&
           !currentUtterance &&
           !queuedReply
@@ -1760,8 +1857,6 @@ function playSpeech(reply) {
     );
   };
 
-  // A timeout is treated as failure, not successful playback.
-  // That prevents the microphone reopening over a silent reply.
   const timeout = Math.max(
     15000,
     5000 + reply.text.length * 160
@@ -1784,27 +1879,9 @@ function playSpeech(reply) {
   }
 }
 
-function speakDuties(matches) {
-  if (!matches.length) {
-    speak("No road found.");
-    return;
-  }
-
-  if (matches.length > 5) {
-    speak(`${matches.length} entries. See the screen.`);
-    return;
-  }
-
-  const message = matches.map(
-    entry =>
-      `${entry.base}, duty ${displayWalk(entry.walk)}`
-  ).join(". ");
-
-  speak(message);
-}
-
 function listenAuto() {
   if (
+    interactionMode !== "voice" ||
     !autoListenToggle.checked ||
     document.hidden ||
     micState !== "idle"
@@ -1834,22 +1911,16 @@ function updateMicButton() {
 function setupVoiceButton() {
   if (!SpeechRec) {
     micBtn.hidden = true;
-
-    setAudioStatus(
-      "Voice input is unavailable. You can still type searches."
-    );
-
     return;
   }
 
   micBtn.onclick = () => {
     if (micState !== "idle") {
-      requestRecognitionStop();
+      beginTextInteraction(false);
       return;
     }
 
-    clearTimeout(typingTimer);
-    cancelSpeech();
+    beginVoiceInteraction();
     startListening(false);
   };
 }
@@ -1889,8 +1960,6 @@ function requestRecognitionStop(discardResult = false) {
       return;
     }
 
-    // Ask Safari to abort, but do NOT claim the mic is
-    // released until onend actually arrives.
     session.ignoreResults = true;
 
     try {
@@ -1899,6 +1968,7 @@ function requestRecognitionStop(discardResult = false) {
       console.warn("Could not abort recognition:", error);
     }
 
+    // Do not falsely mark the mic idle before onend.
     setAudioStatus(
       "Safari has not reported that the microphone stopped. " +
       "If it stays stuck, reload the page."
@@ -1911,10 +1981,14 @@ function startListening(automatic) {
     !SpeechRec ||
     !dataReady ||
     document.hidden ||
-    micState !== "idle"
+    micState !== "idle" ||
+    interactionMode !== "voice"
   ) {
     return;
   }
+
+  // Extra safeguard against restarting from a stale callback.
+  if (automatic && !autoListenToggle.checked) return;
 
   if (currentUtterance || queuedReply) return;
 
@@ -1942,9 +2016,12 @@ function startListening(automatic) {
   session.onstart = () => {
     if (recognizer !== session) return;
 
-    // If the user stopped while startup was pending,
-    // keep the stopping state and ask Safari to abort.
-    if (micState === "stopping") {
+    if (
+      micState === "stopping" ||
+      interactionMode !== "voice"
+    ) {
+      session.ignoreResults = true;
+
       try {
         session.abort();
       } catch (error) {
@@ -1964,7 +2041,8 @@ function startListening(automatic) {
     if (
       recognizer !== session ||
       session.ignoreResults ||
-      gotResult
+      gotResult ||
+      interactionMode !== "voice"
     ) {
       return;
     }
@@ -1986,8 +2064,6 @@ function startListening(automatic) {
       `Heard: ${alternatives[0]}`;
 
     try {
-      // The microphone is still marked active here,
-      // so any spoken response is queued.
       handleVoice(alternatives);
     } catch (error) {
       console.error(error);
@@ -1997,7 +2073,6 @@ function startListening(automatic) {
         "Could not process that request. Tap Speak to try again."
       );
     } finally {
-      // Explicitly stop after a final result.
       requestRecognitionStop();
     }
   };
@@ -2007,7 +2082,12 @@ function startListening(automatic) {
 
     hadError = true;
 
-    if (session.ignoreResults) return;
+    if (
+      session.ignoreResults ||
+      interactionMode !== "voice"
+    ) {
+      return;
+    }
 
     console.warn("Recognition error:", event.error);
 
@@ -2033,9 +2113,6 @@ function startListening(automatic) {
       transcriptEl.textContent =
         `Voice input failed: ${event.error}. Tap Speak to retry.`;
     }
-
-    // Errors do not prove that the audio session ended.
-    // Only onend releases the queued speech.
   };
 
   session.onend = () => {
@@ -2053,7 +2130,8 @@ function startListening(automatic) {
     if (
       !gotResult &&
       !hadError &&
-      !session.ignoreResults
+      !session.ignoreResults &&
+      interactionMode === "voice"
     ) {
       transcriptEl.textContent =
         "Didn't hear anything. Tap Speak to try again.";
@@ -2068,6 +2146,7 @@ function startListening(automatic) {
 
   micState = "starting";
   updateMicButton();
+
   transcriptEl.textContent = "Starting microphone...";
   setAudioStatus("");
 
@@ -2076,7 +2155,6 @@ function startListening(automatic) {
   } catch (error) {
     console.error(error);
 
-    // start() threw, so this session did not start.
     if (recognizer === session) {
       recognizer = null;
       micState = "idle";
