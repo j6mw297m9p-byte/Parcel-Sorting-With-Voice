@@ -54,6 +54,13 @@
     <ul id="results"></ul>
   </main>
 
+  <script>
+    // Shows any script error on the page, since iPhone does not show them
+    window.onerror = function (msg, src, line) {
+      var t = document.getElementById("transcript");
+      if (t) t.textContent = "Error: " + msg + " (line " + line + ")";
+    };
+  </script>
   <script src="app.js"></script>
 </body>
 </html>
