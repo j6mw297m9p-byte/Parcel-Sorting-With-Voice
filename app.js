@@ -2,10 +2,11 @@
 
 // ---------- Settings ----------
 const PAUSE_MS = 900;          // pause after typing before a house number or postcode is read aloud
-const SPEECH_RATE = 1.2;       // 1 is normal speed
+const SPEECH_RATE = 1.0;       // 1 is normal speed. Try 0.9 if it still sounds fast
 const MIN_SUGGEST = 0.6;       // 0 to 1: how close a name must be to be offered as "did you mean"
 const AREA_KEY = "sortingArea";
 const AREA_SPOKEN = { ME10: "ME ten", ME9: "ME nine" };
+const ORDINAL = ["One", "Two", "Three", "Four", "Five"];
 const OPTION_STYLE = "width:100%;text-align:left;padding:12px;font-size:17px;background:#fff;color:#1d1d1f;border:1px solid #d9d9d6;border-radius:8px;";
 
 // Words ignored when comparing names, so "Chalkwell" matches "Chalkwell Road"
@@ -15,19 +16,35 @@ const SUFFIXES = new Set([
   "MEWS", "RISE", "HOUSE", "THE"
 ]);
 
-const YES_WORDS = new Set(["yes", "yeah", "yep", "yup", "correct", "right", "that one", "thats it", "ok", "okay", "sure"]);
-const NO_WORDS = new Set(["no", "nope", "wrong", "not that", "none", "neither", "try again"]);
+const YES_WORDS = new Set([
+  "yes", "yeah", "yep", "yup", "correct", "right", "thats right", "thats it",
+  "that one", "ok", "okay", "sure", "confirm"
+]);
+const NO_WORDS = new Set(["no", "nope", "wrong", "incorrect", "not that"]);
+const CANCEL_WORDS = new Set(["none", "neither", "none of these", "cancel", "try again", "start again"]);
+
+// Words the recogniser often produces for numbers. Only whole phrases are changed
+const NUMBER_ALIASES = {
+  won: "1", wan: "1", to: "2", too: "2", tu: "2", tree: "3", free: "3",
+  for: "4", fore: "4", ate: "8", first: "1", second: "2", third: "3", fourth: "4", fifth: "5"
+};
 
 // ---------- State ----------
 let roads = [];               // every row from roads.csv, each tagged with its area
 let selectedArea = "ME10";    // "ME10" or "ME9"
 let pending = null;           // { matches } while waiting for a house number or postcode
-let suggestions = null;       // { options } while waiting for yes, a number or a tap
+let suggestions = null;       // { options, stage: "choose" or "confirm", chosen } for "did you mean"
 let typingTimer = null;
 let speechUnlocked = false;
+let currentUtterance = null;
 
 let letterGrid, walkGrid, results, roadTab, walkTab, me10Tab, me9Tab, areaLabel;
 let input, micBtn, transcriptEl, resetBtn;
+
+let recognizer = null;
+let listening = false;
+let autoStart = false;
+let lastError = null;
 
 const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
 
@@ -209,9 +226,11 @@ function normalise(s) {
   return String(s).toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
-// "U070" and "U70" compare equal
+// T, U and Z codes join their number: T61, U070 and Z10 become 61, 70 and 10
 function walkKey(s) {
-  return normalise(s).replace(/^([A-Z]*)0+(?=\d)/, "$1");
+  const n = normalise(s);
+  const m = n.match(/^([TUZ]?)(\d+)$/);
+  return m ? String(parseInt(m[2], 10)) : n;
 }
 
 function areaRoads() {
@@ -325,19 +344,22 @@ function scoreName(spokenCore, cand) {
 
 // Returns the closest road names in the selected area, best first
 function suggestRoads(spokenList, limit = 3) {
-  const bases = [...new Map(
-    areaRoads().map(r => [r.baseN, { base: r.base, core: coreName(r.base) }])
-  ).values()];
+  const bases = new Map();
+  for (const r of areaRoads()) {
+    if (!bases.has(r.baseN)) {
+      bases.set(r.baseN, { base: r.base, baseN: r.baseN, core: coreName(r.base) });
+    }
+  }
 
   const best = new Map();
   for (const spoken of spokenList) {
     const said = coreName(spoken);
     if (said.length < 3) continue;
-    for (const b of bases) {
+    for (const b of bases.values()) {
       const score = scoreName(said, b.core);
       if (score < MIN_SUGGEST) continue;
-      const prev = best.get(b.base);
-      if (!prev || prev.score < score) best.set(b.base, { ...b, score });
+      const prev = best.get(b.baseN);
+      if (!prev || prev.score < score) best.set(b.baseN, { ...b, score });
     }
   }
   return [...best.values()].sort((a, b) => b.score - a.score).slice(0, limit);
@@ -349,6 +371,45 @@ function fixCodes(s) {
     .replace(/\b(you|u)\s*(\d)/gi, "U$2")
     .replace(/\b(tea|tee|t)\s*(\d)/gi, "T$2")
     .replace(/\b(zed|zee|said|z)\s*(\d)/gi, "Z$2");
+}
+
+// ---------- Spoken text ----------
+function cleanSpoken(s) {
+  return String(s).toLowerCase().replace(/['\u2019]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+// "number two", "option 2", "to" and "won" all become a digit string where possible
+function heardAsNumber(raw) {
+  const s = cleanSpoken(raw).replace(/^(number|option|house number|house|the) /, "");
+  if (NUMBER_ALIASES[s] !== undefined) return NUMBER_ALIASES[s];
+  return wordsToDigits(s);
+}
+
+// Returns the index of a numbered choice, or -1 if the words are not a valid number
+function choiceIndex(raw, count) {
+  const n = Number(heardAsNumber(raw));
+  return Number.isInteger(n) && n >= 1 && n <= count ? n - 1 : -1;
+}
+
+function wordsToDigits(text) {
+  const words = text.toLowerCase().trim().split(/\s+/);
+  const out = [];
+  for (let i = 0; i < words.length; i++) {
+    const v = NUMBER_WORDS[words[i]];
+    if (v === undefined) {
+      out.push(words[i]);
+      continue;
+    }
+    // "twenty one" becomes 21
+    const next = NUMBER_WORDS[words[i + 1]];
+    if (v >= 20 && next !== undefined && next > 0 && next < 10) {
+      out.push(String(v + next));
+      i++;
+    } else {
+      out.push(String(v));
+    }
+  }
+  return out.join(" ");
 }
 
 // ---------- Area (ME10 / ME9) ----------
@@ -386,6 +447,7 @@ function setArea(name, speakIt) {
   applyArea(name);
   rememberArea(name);
   pending = null;
+  suggestions = null;
   clearTimeout(typingTimer);
   buildGrids();
 
@@ -399,7 +461,7 @@ function setArea(name, speakIt) {
   input.value = "";
   clearResults();
   showNote(`Showing ${name}. Type or say a road name.`);
-  if (speakIt) speak(`Showing ${AREA_SPOKEN[name]}`);
+  if (speakIt) speak(`Showing ${AREA_SPOKEN[name]}`, listenAuto);
 }
 
 // ---------- Grids and tabs ----------
@@ -416,9 +478,9 @@ function buildLetterGrid() {
 
 function buildWalkGrid() {
   walkGrid.innerHTML = "";
-  const walks = [...new Set(areaRoads().map(r => r.walk))]
+  const groups = [...new Set(areaRoads().map(r => walkKey(r.walk)))]
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  walks.forEach(walk => addButton(walkGrid, walk, () => showByWalk(walk)));
+  groups.forEach(key => addButton(walkGrid, key, () => showByWalk(key)));
 }
 
 function addButton(parent, label, onClick) {
@@ -467,9 +529,9 @@ function showLetter(letter, speakIt = false) {
   showDuties(areaRoads().filter(r => r.letter === letter), speakIt);
 }
 
-function showByWalk(walk, speakIt = false) {
+function showByWalk(key, speakIt = false) {
   pending = null;
-  showDuties(areaRoads().filter(r => r.walk === walk), speakIt);
+  showDuties(areaRoads().filter(r => walkKey(r.walk) === key), speakIt);
 }
 
 function showDuties(matches, speakIt) {
@@ -509,65 +571,105 @@ function resultRow(m) {
   return li;
 }
 
-function showNote(text) {
-  suggestions = null;
-  results.innerHTML = "";
+function makeNote(text) {
   const li = document.createElement("li");
   li.className = "note";
   li.textContent = text;
-  results.appendChild(li);
+  return li;
+}
+
+function showNote(text) {
+  suggestions = null;
+  results.innerHTML = "";
+  results.appendChild(makeNote(text));
+}
+
+function optionRow(label, onClick, dashed = false) {
+  const li = document.createElement("li");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = label;
+  btn.style.cssText = OPTION_STYLE + (dashed ? "color:#555;border-style:dashed;" : "");
+  btn.onclick = onClick;
+  li.appendChild(btn);
+  return li;
 }
 
 function askDetail(matches, message, speakIt) {
   pending = { matches };
   compactGrids();
   showNote(message);
-  if (speakIt) speak(message);
+  if (speakIt) speak(message, listenAuto);
 }
 
-// ---------- Suggestions ("did you mean") ----------
-function showSuggestions(options, speakIt) {
-  suggestions = { options };
+// ---------- "Did you mean" with read-back ----------
+// Stage "choose": the options are listed and the user says a number or a name.
+// Stage "confirm": the chosen option is read back and the user says yes or no.
+function offerOptions(options, speakIt) {
+  suggestions = { options, stage: "choose", chosen: -1 };
+  renderChoose(speakIt);
+}
+
+function renderChoose(speakIt) {
+  const options = suggestions.options;
   compactGrids();
   results.innerHTML = "";
-
-  const heading = document.createElement("li");
-  heading.className = "note";
-  heading.textContent = options.length === 1 ? "Did you mean this?" : "Did you mean one of these?";
-  results.appendChild(heading);
+  results.appendChild(makeNote(options.length === 1 ? "Did you mean this?" : "Did you mean one of these?"));
 
   options.forEach((opt, i) => {
-    const li = document.createElement("li");
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.textContent = options.length > 1 ? `${i + 1}. ${opt.base}` : opt.base;
-    btn.style.cssText = OPTION_STYLE;
-    btn.onclick = () => chooseSuggestion(i);
-    li.appendChild(btn);
-    results.appendChild(li);
+    const label = options.length > 1 ? `${i + 1}. ${opt.base}` : opt.base;
+    results.appendChild(optionRow(label, () => pickOption(i)));
   });
+  results.appendChild(optionRow("None of these", cancelSuggestions, true));
 
-  const none = document.createElement("li");
-  const noneBtn = document.createElement("button");
-  noneBtn.type = "button";
-  noneBtn.textContent = "None of these";
-  noneBtn.style.cssText = OPTION_STYLE + "color:#555;border-style:dashed;";
-  noneBtn.onclick = cancelSuggestions;
-  none.appendChild(noneBtn);
-  results.appendChild(none);
-
-  if (speakIt) speak(suggestionPrompt(options));
+  if (speakIt) speak(choosePrompt(options), listenAuto);
 }
 
-function suggestionPrompt(options) {
+function renderConfirm(speakIt) {
+  const i = suggestions.chosen;
+  compactGrids();
+  results.innerHTML = "";
+  results.appendChild(makeNote(`${ORDINAL[i]}: ${suggestions.options[i].base}. Is that right?`));
+  results.appendChild(optionRow("Yes, that one", () => acceptOption(i)));
+  results.appendChild(optionRow("No, choose again", backToChoose, true));
+
+  if (speakIt) speak(confirmPrompt(i), listenAuto);
+}
+
+function choosePrompt(options) {
   if (options.length === 1) return `Did you mean ${options[0].base}? Say yes or no.`;
   return `Did you mean: ${options.map((o, i) => `${i + 1}, ${o.base}`).join(". ")}? Say the number.`;
 }
 
-function chooseSuggestion(i) {
-  const opt = suggestions ? suggestions.options[i] : null;
+function confirmPrompt(i) {
+  const opt = suggestions.options[i];
+  const entries = areaRoads().filter(r => r.baseN === opt.baseN);
+  const duty = entries.length === 1 ? `, duty ${spokenCode(entries[0].walk)}` : "";
+  return `${ORDINAL[i]}: ${opt.base}${duty}. Is that right? Say yes or no.`;
+}
+
+function pickOption(i) {
+  if (!suggestions || !suggestions.options[i]) return;
+  if (suggestions.options.length === 1) {
+    acceptOption(0);
+    return;
+  }
+  suggestions.stage = "confirm";
+  suggestions.chosen = i;
+  renderConfirm(true);
+}
+
+function backToChoose() {
+  if (!suggestions) return;
+  suggestions.stage = "choose";
+  suggestions.chosen = -1;
+  renderChoose(true);
+}
+
+function acceptOption(i) {
+  if (!suggestions || !suggestions.options[i]) return;
+  const opt = suggestions.options[i];
   suggestions = null;
-  if (!opt) return;
   input.value = opt.base;
   lookup(opt.base, true);   // a road with several entries still asks for the house number
 }
@@ -576,27 +678,49 @@ function cancelSuggestions() {
   suggestions = null;
   input.value = "";
   showNote("Okay. Say or type the road name again.");
-  speak("Okay. Say the road again.");
+  speak("Okay. Say the road again.", listenAuto);
 }
 
-// Handles "yes", "no", a number, or the name of an option. Returns true if it was used.
+// Handles yes, no, a number, a name, or a cancel. Returns true if it was used.
 function handleSuggestionVoice(alts) {
-  const options = suggestions.options;
+  const { options, stage, chosen } = suggestions;
+
   for (const raw of alts) {
-    const said = wordsToDigits(raw.toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim())
-      .replace(/^(number|option) /, "");
+    const said = cleanSpoken(raw);
 
-    if (YES_WORDS.has(said)) { chooseSuggestion(0); return true; }
-    if (NO_WORDS.has(said)) { cancelSuggestions(); return true; }
-
-    const n = Number(said);
-    if (Number.isInteger(n) && n >= 1 && n <= options.length) {
-      chooseSuggestion(n - 1);
+    if (CANCEL_WORDS.has(said)) {
+      cancelSuggestions();
       return true;
     }
 
-    const idx = options.findIndex(o => coreName(raw) === o.core);
-    if (idx !== -1) { chooseSuggestion(idx); return true; }
+    if (stage === "confirm") {
+      if (YES_WORDS.has(said)) { acceptOption(chosen); return true; }
+      if (NO_WORDS.has(said)) { backToChoose(); return true; }
+    } else {
+      if (YES_WORDS.has(said)) {
+        if (options.length === 1) { acceptOption(0); return true; }
+        speak("Say the number of the road you want.", listenAuto);
+        return true;
+      }
+      if (NO_WORDS.has(said)) {
+        cancelSuggestions();
+        return true;
+      }
+    }
+
+    const idx = choiceIndex(raw, options.length);
+    if (idx !== -1) {
+      pickOption(idx);
+      return true;
+    }
+
+    // A name only counts if exactly one option has that name
+    const core = coreName(raw);
+    const named = options.filter(o => o.core === core);
+    if (named.length === 1) {
+      pickOption(options.indexOf(named[0]));
+      return true;
+    }
   }
   return false;
 }
@@ -612,6 +736,13 @@ function handleInput(text, mode) {
     pending = null;
     clearResults();
     return;
+  }
+
+  if (suggestions) {
+    // Typing alone does not change a pending choice. Enter does
+    if (mode !== "final") return;
+    if (handleSuggestionVoice([q])) return;
+    suggestions = null;   // a different search has been typed
   }
 
   if (pending) {
@@ -671,7 +802,7 @@ function lookup(q, speakIt) {
     }
 
     const options = suggestRoads([q]);
-    if (options.length) showSuggestions(options, speakIt);
+    if (options.length) offerOptions(options, speakIt);
     else showDuties([], speakIt);
     return;
   }
@@ -684,13 +815,14 @@ function lookup(q, speakIt) {
 }
 
 function handleVoice(alts) {
-  // Number words become digits and letter codes are fixed, e.g. "you seventy" becomes U70
-  const spoken = alts.map(a => fixCodes(wordsToDigits(a)));
-
-  // A "did you mean" question comes first, so "yes" or "two" answers it
+  // An open "did you mean" question comes first
   if (suggestions && handleSuggestionVoice(alts)) return;
+  suggestions = null;
 
-  // An open question about a house number or postcode comes next
+  // Number words become digits and letter codes are fixed, e.g. "you seventy" becomes U70
+  const spoken = alts.map(a => fixCodes(heardAsNumber(a)));
+
+  // An open question about a house number or postcode
   if (pending) {
     for (const s of spoken) {
       const hits = answerPending(s);
@@ -746,39 +878,41 @@ function handleVoice(alts) {
   // Nothing matched exactly, so offer the closest names and wait for confirmation
   pending = null;
   input.value = spoken[0];
-  const options = suggestRoads(spoken);
-  if (options.length) showSuggestions(options, true);
-  else showDuties([], true);
-}
-
-function wordsToDigits(text) {
-  const words = text.toLowerCase().trim().split(/\s+/);
-  const out = [];
-  for (let i = 0; i < words.length; i++) {
-    const v = NUMBER_WORDS[words[i]];
-    if (v === undefined) {
-      out.push(words[i]);
-      continue;
-    }
-    // "twenty one" becomes 21
-    const next = NUMBER_WORDS[words[i + 1]];
-    if (v >= 20 && next !== undefined && next > 0 && next < 10) {
-      out.push(String(v + next));
-      i++;
-    } else {
-      out.push(String(v));
-    }
+  const options = suggestRoads(alts);
+  if (options.length) {
+    offerOptions(options, true);
+    return;
   }
-  return out.join(" ");
+  showNote("No road found. Tap Speak to try again.");
+  speak("No road found. Say the road again.", listenAuto);
 }
 
-// ---------- Speech ----------
-function speak(text) {
-  if (!("speechSynthesis" in window)) return;
+// ---------- Speech output ----------
+// speak() can report when the reply has finished, so listening can start after it
+function speak(text, onDone) {
+  if (!("speechSynthesis" in window)) {
+    if (onDone) onDone();
+    return;
+  }
+
   speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
   u.lang = "en-GB";
   u.rate = SPEECH_RATE;
+  currentUtterance = u;
+
+  if (onDone) {
+    let finished = false;
+    const finish = () => {
+      if (finished || u !== currentUtterance) return;
+      finished = true;
+      onDone();
+    };
+    u.onend = finish;
+    // Safety net in case iOS never reports the end of the speech
+    setTimeout(finish, 1500 + text.length * 100);
+  }
+
   speechSynthesis.speak(u);
 }
 
@@ -806,44 +940,73 @@ function speakDuties(matches) {
   speak(matches.map(m => `${m.base}, duty ${spokenCode(m.walk)}`).join(". "));
 }
 
+// ---------- Speech input ----------
+function startListening(auto) {
+  if (!recognizer) return;
+  if (listening) return;
+
+  autoStart = auto;
+  lastError = null;
+  try {
+    recognizer.start();
+    listening = true;
+    transcriptEl.textContent = "Listening...";
+  } catch (e) {
+    listening = false;
+    transcriptEl.textContent = "Tap Speak and say your choice.";
+  }
+}
+
+// Called once a spoken question has finished. iOS may refuse this, in which case the user taps Speak
+function listenAuto() {
+  startListening(true);
+}
+
 function setupVoice() {
   if (!SpeechRec) {
     micBtn.hidden = true;
     return;
   }
 
-  const rec = new SpeechRec();
-  rec.lang = "en-GB";
-  rec.continuous = false;
-  rec.interimResults = false;
-  rec.maxAlternatives = 5;
+  recognizer = new SpeechRec();
+  recognizer.lang = "en-GB";
+  recognizer.continuous = false;
+  recognizer.interimResults = false;
+  recognizer.maxAlternatives = 5;
 
-  // start() must run directly inside the tap on iOS
-  micBtn.onclick = () => {
-    unlockSpeech();
-    transcriptEl.textContent = "Listening...";
-    try {
-      rec.start();
-    } catch (e) {
-      // already listening
-    }
-  };
-
-  rec.onresult = e => {
+  recognizer.onresult = e => {
     const alts = Array.from(e.results[0], a => a.transcript);
     transcriptEl.textContent = `Heard: ${alts[0]}`;
     handleVoice(alts);
   };
 
-  rec.onerror = e => {
-    transcriptEl.textContent = e.error === "not-allowed"
-      ? "Microphone is blocked. Allow it for this site in Safari's settings, then reload."
-      : "Didn't catch that. Tap Speak and try again.";
+  recognizer.onerror = e => {
+    lastError = e.error;
+    listening = false;
+
+    if (e.error === "no-speech") {
+      transcriptEl.textContent = "Didn't hear anything. Tap Speak to try again.";
+    } else if (e.error === "not-allowed") {
+      transcriptEl.textContent = autoStart
+        ? "Tap Speak and say your choice."
+        : "Microphone is blocked. Allow it for this site in Safari's settings, then reload.";
+    } else if (e.error === "aborted") {
+      if (autoStart) transcriptEl.textContent = "Tap Speak and say your choice.";
+    } else {
+      transcriptEl.textContent = "Didn't catch that. Tap Speak and try again.";
+    }
   };
 
-  rec.onend = () => {
-    if (transcriptEl.textContent === "Listening...") {
+  recognizer.onend = () => {
+    listening = false;
+    if (!lastError && transcriptEl.textContent === "Listening...") {
       transcriptEl.textContent = "Didn't hear anything. Tap Speak to try again.";
     }
+  };
+
+  micBtn.onclick = () => {
+    unlockSpeech();
+    if ("speechSynthesis" in window) speechSynthesis.cancel();
+    startListening(false);
   };
 }
