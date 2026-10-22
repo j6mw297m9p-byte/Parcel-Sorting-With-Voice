@@ -8,13 +8,33 @@
   <meta name="theme-color" content="#D40511">
   <title>Sorting Assistant</title>
   <link rel="stylesheet" href="style.css">
+  <style>
+    /* Area switch sits above the mode tabs, with a clear dark active state */
+    .area { margin-bottom: 10px; }
+    .area .tab { background: #fff; color: #1d1d1f; border-color: #1d1d1f; font-weight: 600; }
+    .area .tab.active { background: #1d1d1f; color: #fff; }
+    .area-badge {
+      display: inline-block;
+      margin-left: 8px;
+      padding: 2px 8px;
+      font-size: 14px;
+      border-radius: 6px;
+      background: #fff;
+      color: var(--red);
+    }
+  </style>
 </head>
 <body>
   <header>
-    <h1>Sorting Assistant</h1>
+    <h1>Sorting Assistant <span id="areaLabel" class="area-badge">ME10</span></h1>
   </header>
 
   <main>
+    <nav class="tabs area" aria-label="Area">
+      <button id="me10Tab" class="tab active" type="button">ME10</button>
+      <button id="me9Tab" class="tab" type="button">ME9</button>
+    </nav>
+
     <nav class="tabs">
       <button id="roadTab" class="tab active" type="button">Road Lookup</button>
       <button id="walkTab" class="tab" type="button">Duty Lookup</button>
@@ -22,7 +42,7 @@
 
     <section class="search">
       <input id="roadSearch" type="search" autocomplete="off" autocapitalize="characters"
-             placeholder="Type or say a road name">
+             enterkeyhint="search" placeholder="Type or say a road name">
       <button id="micBtn" type="button" class="mic">🎤 Speak</button>
       <button id="resetBtn" type="button">Reset</button>
     </section>
