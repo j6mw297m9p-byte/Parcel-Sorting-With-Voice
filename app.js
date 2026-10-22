@@ -6,8 +6,13 @@
 
 const AREA_KEY = "sortingArea";
 const AUTO_KEY = "sortingAutoListen";
+
 const HANDOVER_MS = 600;
+const LISTEN_TIMEOUT_MS = 15000;
+const STOP_TIMEOUT_MS = 5000;
+
 const MIN_SUGGEST = 0.6;
+const MAX_READ_RESULTS = 8;
 
 const SpeechRec =
   window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -19,17 +24,17 @@ const SUFFIXES = new Set([
   "PARK", "WALK", "PLACE", "MEWS", "RISE", "HOUSE", "THE"
 ]);
 
-const YES = new Set([
+const YES_WORDS = new Set([
   "yes", "yeah", "yep", "yup", "correct", "right",
   "thats right", "thats it", "that one", "ok",
   "okay", "sure", "confirm"
 ]);
 
-const NO = new Set([
+const NO_WORDS = new Set([
   "no", "nope", "wrong", "incorrect", "not that"
 ]);
 
-const CANCEL = new Set([
+const CANCEL_WORDS = new Set([
   "none", "neither", "none of these", "cancel",
   "try again", "start again"
 ]);
@@ -52,6 +57,27 @@ const NUMBER_ALIASES = {
   fourth: "4", fifth: "5"
 };
 
+const NATO_LETTERS = {
+  alpha: "A", alfa: "A", bravo: "B", charlie: "C",
+  delta: "D", echo: "E", foxtrot: "F", golf: "G",
+  hotel: "H", india: "I", juliet: "J", juliett: "J",
+  kilo: "K", lima: "L", mike: "M", november: "N",
+  oscar: "O", papa: "P", quebec: "Q", romeo: "R",
+  sierra: "S", tango: "T", uniform: "U", victor: "V",
+  whiskey: "W", whisky: "W", xray: "X", yankee: "Y",
+  zulu: "Z"
+};
+
+const SPOKEN_LETTERS = {
+  bee: "B", be: "B", cee: "C", see: "C",
+  dee: "D", ee: "E", gee: "G", aitch: "H",
+  jay: "J", kay: "K", el: "L", ell: "L",
+  em: "M", en: "N", pea: "P", pee: "P",
+  cue: "Q", queue: "Q", are: "R", ess: "S",
+  tee: "T", tea: "T", you: "U", vee: "V",
+  doubleyou: "W", ex: "X", why: "Y", zed: "Z", zee: "Z"
+};
+
 const HOUSES_AFTER_NAME =
   /^(.*?)\s+(\d{1,3}(?:-\d{1,3})?(?:\s+\d{1,3}(?:-\d{1,3})?)*)$/;
 
@@ -61,29 +87,52 @@ const HOUSES_AFTER_NAME =
 
 let roads = [];
 let ready = false;
-let area = "ME10";
-let mode = "text";
+let selectedArea = "ME10";
+let interactionMode = "text";
 
 let pending = null;
 let suggestions = null;
 
-let manifest = new Map();
+const manifest = new Map();
 let manifestReady = false;
 
+// A single recogniser is created once and reused.
+// It is never replaced while an old session may still be active.
 let recognizer = null;
 let micState = "idle";
 let micReleasedAt = 0;
-let stopTimer = null;
+let runNumber = 0;
 
-let audio = null;
+let activeRun = null;
+let listenTimer = null;
+let stopTimer = null;
+let abortTimer = null;
+
+// Playback.
+let audio;
+let nextAudio;
 let playbackVersion = 0;
 let playbackActive = false;
 let queuedReply = null;
 let lastReply = null;
 let playbackTimer = null;
 let autoTimer = null;
-let cancelClip = null;
+let cancelCurrentClip = null;
 
+// Web Audio playback (avoids the <audio> element, which on iOS
+// reconfigures the audio session and can leave the microphone stuck).
+let audioCtx = null;
+let activeSources = [];
+const bufferCache = new Map();
+const roadLoose = new Map();
+let micStream = null;
+let micReadyToggle;
+
+const APP_VERSION = "Web Audio playback v1";
+const CLIP_GAP_SECONDS = 0.15;
+const MIC_READY_KEY = "sortingMicReady";
+
+// Page elements.
 let input;
 let micBtn;
 let transcript;
@@ -95,9 +144,15 @@ let walkTab;
 let me10Tab;
 let me9Tab;
 let areaLabel;
+
 let replayBtn;
-let audioStatus;
 let autoToggle;
+let audioStatus;
+let micStatus;
+let diagnosticPanel;
+let diagnosticButton;
+
+const diagnosticLines = [];
 
 // ============================================================
 // Startup
@@ -108,10 +163,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   micBtn = document.getElementById("micBtn");
   transcript = document.getElementById("transcript");
   results = document.getElementById("results");
+
   letterGrid = document.getElementById("letterGrid");
   walkGrid = document.getElementById("walkGrid");
   roadTab = document.getElementById("roadTab");
   walkTab = document.getElementById("walkTab");
+
   me10Tab = document.getElementById("me10Tab");
   me9Tab = document.getElementById("me9Tab");
   areaLabel = document.getElementById("areaLabel");
@@ -119,8 +176,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   audio = new Audio();
   audio.preload = "auto";
 
-  createAudioControls();
-  setupMic();
+  nextAudio = new Audio();
+  nextAudio.preload = "auto";
+
+  createControls();
+  setupRecognizer();
 
   roadTab.onclick = () => {
     enterTextMode();
@@ -163,6 +223,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
+      logVoice("Page hidden: cancelling voice interaction.");
       enterTextMode(false);
     }
   });
@@ -172,9 +233,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   micBtn.disabled = true;
-  note("Loading roads...");
+  showNote("Loading roads...");
 
-  const audioLoading = loadManifest();
+  const recordingsLoading = loadManifest();
 
   try {
     const response = await fetch("roads.csv");
@@ -186,28 +247,37 @@ document.addEventListener("DOMContentLoaded", async () => {
     roads = parseCsv(await response.text());
 
     if (!roads.length) {
-      throw new Error("No usable roads found.");
+      throw new Error("No usable road entries found.");
     }
 
-    const saved = readSetting(AREA_KEY);
-    area = saved === "ME9" ? "ME9" : "ME10";
-    ready = true;
+    selectedArea =
+      readSetting(AREA_KEY) === "ME9" ? "ME9" : "ME10";
 
+    ready = true;
     applyArea();
     buildGrids();
     switchMode("road");
 
-    note(`Showing ${area}. Type or say a road name.`);
+    showNote(
+      `Showing ${selectedArea}. Type or say a road name.`
+    );
   } catch (error) {
     console.error(error);
-    note("Could not load roads.csv. Check the file and columns.");
+    showNote("Could not load roads.csv. Check the file and columns.");
   }
 
-  await audioLoading;
-  micBtn.disabled = !ready;
+  await recordingsLoading;
+
+  micBtn.disabled = !ready || !recognizer;
+
+  logVoice(
+    `${APP_VERSION} loaded. AudioContext: ` +
+    `${window.AudioContext || window.webkitAudioContext ? "yes" : "no"}` +
+    `, audioSession: ${navigator.audioSession ? "yes" : "no"}.`
+  );
 });
 
-function createAudioControls() {
+function createControls() {
   const box = document.createElement("div");
   box.style.margin = "10px 0";
 
@@ -215,17 +285,20 @@ function createAudioControls() {
   replayBtn.type = "button";
   replayBtn.textContent = "Read reply aloud";
   replayBtn.disabled = true;
-  replayBtn.style.padding = "10px 12px";
-  replayBtn.style.fontSize = "16px";
+
+  Object.assign(replayBtn.style, {
+    padding: "10px 12px",
+    fontSize: "16px"
+  });
 
   replayBtn.onclick = () => {
     if (!lastReply) return;
 
-    const reply = lastReply;
-    enterTextMode(false);
+    unlockAudio();
 
-    // Explicit replay never automatically opens the mic.
-    requestPlayback(reply.keys, false);
+    const keys = [...lastReply.keys];
+    enterTextMode(false);
+    requestPlayback(keys, false);
   };
 
   const label = document.createElement("label");
@@ -244,6 +317,10 @@ function createAudioControls() {
       clearTimeout(autoTimer);
       autoTimer = null;
     }
+
+    logVoice(
+      `Automatic listening: ${autoToggle.checked ? "on" : "off"}.`
+    );
   };
 
   label.append(
@@ -253,18 +330,124 @@ function createAudioControls() {
     )
   );
 
+  const readyLabel = document.createElement("label");
+  readyLabel.style.display = "block";
+  readyLabel.style.marginTop = "6px";
+
+  micReadyToggle = document.createElement("input");
+  micReadyToggle.type = "checkbox";
+  micReadyToggle.checked = readSetting(MIC_READY_KEY) === "true";
+  micReadyToggle.style.marginRight = "8px";
+
+  micReadyToggle.onchange = () => {
+    saveSetting(MIC_READY_KEY, String(micReadyToggle.checked));
+    setMicReady(micReadyToggle.checked);
+  };
+
+  readyLabel.append(
+    micReadyToggle,
+    document.createTextNode(
+      "Keep microphone ready (experimental, iPhone)"
+    )
+  );
+
+  micStatus = document.createElement("p");
+  micStatus.setAttribute("role", "status");
+  micStatus.style.fontSize = "14px";
+  micStatus.style.margin = "8px 0";
+
   audioStatus = document.createElement("p");
   audioStatus.setAttribute("role", "status");
-  audioStatus.setAttribute("aria-live", "polite");
   audioStatus.style.fontSize = "14px";
   audioStatus.style.margin = "8px 0";
 
-  box.append(replayBtn, label, audioStatus);
+  diagnosticButton = document.createElement("button");
+  diagnosticButton.type = "button";
+  diagnosticButton.textContent = "Show voice diagnostics";
+
+  diagnosticPanel = document.createElement("textarea");
+  diagnosticPanel.readOnly = true;
+  diagnosticPanel.hidden = true;
+  diagnosticPanel.rows = 10;
+  diagnosticPanel.setAttribute(
+    "aria-label",
+    "Voice event diagnostics"
+  );
+
+  Object.assign(diagnosticPanel.style, {
+    width: "100%",
+    boxSizing: "border-box",
+    marginTop: "8px",
+    fontSize: "13px"
+  });
+
+  diagnosticButton.onclick = () => {
+    diagnosticPanel.hidden = !diagnosticPanel.hidden;
+
+    diagnosticButton.textContent = diagnosticPanel.hidden
+      ? "Show voice diagnostics"
+      : "Hide voice diagnostics";
+  };
+
+  const copyButton = document.createElement("button");
+  copyButton.type = "button";
+  copyButton.textContent = "Copy diagnostics";
+  copyButton.style.marginLeft = "8px";
+
+  copyButton.onclick = async () => {
+    const text = diagnosticLines.join("\n");
+
+    try {
+      if (!navigator.clipboard) throw new Error("Unavailable");
+      await navigator.clipboard.writeText(text);
+      setMicStatus("Diagnostics copied.");
+    } catch (error) {
+      diagnosticPanel.hidden = false;
+      diagnosticButton.textContent = "Hide voice diagnostics";
+      diagnosticPanel.focus();
+      diagnosticPanel.select();
+
+      setMicStatus(
+        "Select and copy the diagnostics from the box."
+      );
+    }
+  };
+
+  box.append(
+    replayBtn,
+    label,
+    readyLabel,
+    micStatus,
+    audioStatus,
+    diagnosticButton,
+    copyButton,
+    diagnosticPanel
+  );
+
   transcript.insertAdjacentElement("afterend", box);
 }
 
-function status(text) {
+function setAudioStatus(text) {
   audioStatus.textContent = text;
+}
+
+function setMicStatus(text) {
+  micStatus.textContent = text;
+}
+
+function logVoice(message) {
+  const time = new Date().toLocaleTimeString();
+
+  diagnosticLines.push(`${time} ${message}`);
+
+  if (diagnosticLines.length > 100) {
+    diagnosticLines.shift();
+  }
+
+  if (diagnosticPanel) {
+    diagnosticPanel.value = diagnosticLines.join("\n");
+    diagnosticPanel.scrollTop = diagnosticPanel.scrollHeight;
+  }
 }
 
 function readSetting(key) {
@@ -279,27 +462,68 @@ function saveSetting(key, value) {
   try {
     localStorage.setItem(key, value);
   } catch (error) {
-    // Storage is optional.
+    // Saved preferences are optional.
   }
 }
 
 // ============================================================
-// Audio manifest
+// Manifest
 // ============================================================
 
+function compactSpaces(value) {
+  return String(value).trim().replace(/\s+/g, " ");
+}
+
 function clipKey(value) {
-  return String(value).trim().replace(/\s+/g, " ").toUpperCase();
+  return compactSpaces(value).toUpperCase();
+}
+
+function looseRoad(text) {
+  return String(text).toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function recording(key) {
+  const normal = clipKey(key);
+  const direct = manifest.get(normal);
+  if (direct) return direct;
+
+  // Road clips: tolerate area or punctuation differences between
+  // roads.csv, the generator script and this app.
+  const match = normal.match(/^ROAD:(?:ME9|ME10):(.*)$/);
+
+  if (match) {
+    const other = normal.startsWith("ROAD:ME9:") ? "ME10" : "ME9";
+    const swapped = manifest.get(`ROAD:${other}:${match[1]}`);
+    if (swapped) return swapped;
+
+    return roadLoose.get(looseRoad(match[1]));
+  }
+
+  return undefined;
+}
+
+function roadRecordingKey(entry) {
+  const road = compactSpaces(entry.road).toUpperCase();
+  return `road:${entry.area}:${road}`;
+}
+
+function resultRecordingKey(entry) {
+  const road = compactSpaces(entry.road).toUpperCase();
+  return `result:${entry.area}:${road}:${walkKey(entry.walk)}`;
 }
 
 async function loadManifest() {
   try {
-    const response = await fetch("audio/manifest.json");
+    const response = await fetch("audio/manifest.json", {
+      cache: "no-cache"
+    });
 
     if (!response.ok) {
       throw new Error(`manifest.json: HTTP ${response.status}`);
     }
 
     const data = await response.json();
+    const root = new URL("audio/", document.baseURI);
 
     for (const [key, entry] of Object.entries(data)) {
       if (
@@ -310,75 +534,93 @@ async function loadManifest() {
         continue;
       }
 
-      // Your manifest paths are relative to the app root,
-      // not relative to the manifest's audio folder.
       const url = new URL(entry.file, document.baseURI);
-      const audioRoot = new URL("audio/", document.baseURI);
 
       if (
-        url.origin !== audioRoot.origin ||
-        !url.pathname.startsWith(audioRoot.pathname) ||
+        url.origin !== root.origin ||
+        !url.pathname.startsWith(root.pathname) ||
         !url.pathname.toLowerCase().endsWith(".mp3")
       ) {
         continue;
       }
 
-      manifest.set(clipKey(key), {
-        text: entry.text,
-        url: url.href
-      });
+      const stored = { text: entry.text, url: url.href };
+      const normal = clipKey(key);
+
+      manifest.set(normal, stored);
+
+      const roadMatch = normal.match(/^ROAD:(?:ME9|ME10):(.*)$/);
+
+      if (roadMatch) {
+        const loose = looseRoad(roadMatch[1]);
+        if (!roadLoose.has(loose)) roadLoose.set(loose, stored);
+      }
     }
 
     if (!manifest.size) {
-      throw new Error("No usable recordings in manifest.");
+      throw new Error("No usable recordings found.");
     }
 
     manifestReady = true;
-    updateReplay();
+    updateReplayButton();
+
+    let roadCount = 0;
+    let dutyCount = 0;
+
+    for (const key of manifest.keys()) {
+      if (key.startsWith("ROAD:")) roadCount++;
+      if (key.startsWith("DUTY:")) dutyCount++;
+    }
+
+    logVoice(
+      `Manifest loaded: ${manifest.size} entries ` +
+      `(${roadCount} road, ${dutyCount} duty).`
+    );
+
+    if (!roadCount) {
+      setAudioStatus(
+        "audio/manifest.json has no road: entries, so road names " +
+        "cannot be read. Check the manifest was uploaded."
+      );
+    }
   } catch (error) {
     console.error(error);
 
-    status(
-      "Recordings could not load. Check audio/manifest.json " +
-      "and that the audio folder has been pushed to GitHub."
+    setAudioStatus(
+      "Could not load recordings. Check audio/manifest.json."
     );
+
+    logVoice(`Manifest failed: ${error.message}`);
   }
 }
 
-function recording(key) {
-  return manifest.get(clipKey(key));
-}
-
-function updateReplay() {
+function updateReplayButton() {
   replayBtn.disabled = !(
     manifestReady &&
     lastReply &&
-    lastReply.keys.length &&
-    lastReply.keys.every(key => recording(key))
+    lastReply.keys.length
   );
 }
 
-// Store a reply for optional replay.
-// Only voice mode triggers automatic playback.
+function clearReply() {
+  lastReply = null;
+  updateReplayButton();
+}
+
 function reply(keys, listenAfter = false) {
   keys = Array.isArray(keys) ? keys : [keys];
   keys = keys.filter(Boolean);
 
   lastReply = keys.length ? { keys: [...keys] } : null;
-  updateReplay();
+  updateReplayButton();
 
-  if (mode === "voice" && keys.length) {
+  if (interactionMode === "voice" && keys.length) {
     requestPlayback(keys, listenAfter);
   }
 }
 
-function clearReply() {
-  lastReply = null;
-  updateReplay();
-}
-
 // ============================================================
-// Audio-file playback — no speechSynthesis
+// Playback
 // ============================================================
 
 function stopPlayback(forget = false) {
@@ -392,55 +634,82 @@ function stopPlayback(forget = false) {
   queuedReply = null;
   playbackActive = false;
 
-  if (cancelClip) {
-    cancelClip();
-    cancelClip = null;
+  if (cancelCurrentClip) {
+    cancelCurrentClip();
+    cancelCurrentClip = null;
   }
 
-  if (audio) {
-    audio.pause();
-    audio.removeAttribute("src");
-    audio.load();
+  if (audio) audio.pause();
+
+  if (nextAudio) {
+    nextAudio.pause();
+    nextAudio.removeAttribute("src");
+    nextAudio.load();
   }
 
   if (forget) clearReply();
 }
 
 function enterTextMode(forget = true) {
-  mode = "text";
+  interactionMode = "text";
   stopPlayback(forget);
   stopRecognition(true);
+
   transcript.textContent = "";
-  status("");
+
+  if (manifestReady) {
+    setAudioStatus("");
+  }
+
+  if (micState === "idle") {
+    setMicStatus("");
+  }
 }
 
 function requestPlayback(keys, listenAfter) {
   stopPlayback();
 
   lastReply = { keys: [...keys] };
-  updateReplay();
+  updateReplayButton();
 
   if (!manifestReady) {
-    status("Recordings are not loaded. Check audio/manifest.json.");
+    setAudioStatus("Recordings have not loaded.");
     return;
   }
 
-  const missing = keys.find(key => !recording(key));
+  const missing = keys.filter(key => !recording(key));
+  let notice = "";
 
-  if (missing) {
-    status(`No recording available for ${missing}. See the screen.`);
-    return;
+  if (missing.length) {
+    logVoice(
+      `Missing ${missing.length} recording(s): ` +
+      missing.slice(0, 3).join(" | ")
+    );
+
+    keys = keys.filter(key => recording(key));
+
+    if (!keys.length) {
+      setAudioStatus(`Missing recording: ${missing[0]}`);
+      return;
+    }
+
+    const roads = missing.filter(key => /^road:/i.test(key)).length;
+
+    notice = roads
+      ? `${roads} road name(s) had no recording and were skipped.`
+      : `${missing.length} recording(s) were missing.`;
   }
 
   queuedReply = {
     keys: [...keys],
     listenAfter,
+    notice,
     version: playbackVersion
   };
 
   if (micState !== "idle") {
-    status("Stopping microphone before playing reply...");
-    stopRecognition();
+    setAudioStatus("Waiting for microphone to finish...");
+    stopRecognition(false);
     return;
   }
 
@@ -466,10 +735,10 @@ function flushPlayback() {
     return;
   }
 
-  const wait = micReleasedAt + HANDOVER_MS - Date.now();
+  const delay = micReleasedAt + HANDOVER_MS - Date.now();
 
-  if (wait > 0) {
-    playbackTimer = setTimeout(flushPlayback, wait);
+  if (delay > 0) {
+    playbackTimer = setTimeout(flushPlayback, delay);
     return;
   }
 
@@ -479,35 +748,42 @@ function flushPlayback() {
 
 async function runPlayback(job) {
   playbackActive = true;
+  logVoice(`Playback requested: ${job.keys.length} clip(s).`);
 
   try {
-    for (const key of job.keys) {
-      if (
-        job.version !== playbackVersion ||
-        document.hidden ||
-        micState !== "idle"
-      ) {
-        return;
+    const entries = job.keys.map(key => recording(key));
+    let finished = false;
+
+    if (audioCtx) {
+      try {
+        const completed = await playWithWebAudio(job, entries);
+        finished = true;
+
+        if (!completed || job.version !== playbackVersion) return;
+      } catch (error) {
+        if (job.version !== playbackVersion) return;
+
+        logVoice(
+          `Web Audio failed (${error.name}: ${error.message}); ` +
+          "trying the audio element."
+        );
       }
+    }
 
-      const entry = recording(key);
-      status(`Playing: ${entry.text}`);
-
-      const completed = await playClip(entry.url);
-
-      if (!completed || job.version !== playbackVersion) {
-        return;
-      }
+    if (!finished) {
+      const completed = await playWithElement(job);
+      if (!completed) return;
     }
 
     if (job.version !== playbackVersion) return;
 
     playbackActive = false;
-    status("");
+    setAudioStatus(job.notice || "");
+    logVoice("Playback ended.");
 
     if (
       job.listenAfter &&
-      mode === "voice" &&
+      interactionMode === "voice" &&
       autoToggle.checked
     ) {
       autoTimer = setTimeout(() => {
@@ -515,30 +791,27 @@ async function runPlayback(job) {
 
         if (
           job.version === playbackVersion &&
-          mode === "voice" &&
+          interactionMode === "voice" &&
           autoToggle.checked &&
           !document.hidden
         ) {
           startListening(true);
         }
-      }, 350);
+      }, 500);
     }
   } catch (error) {
     if (job.version !== playbackVersion) return;
 
-    playbackActive = false;
     console.error(error);
+    logVoice(`Playback error: ${error.name}: ${error.message}`);
 
     if (error.name === "NotAllowedError") {
-      status(
-        "Safari blocked automatic audio. " +
-        "Tap Read reply aloud to play the recording."
+      setAudioStatus(
+        "Automatic audio was blocked. Tap Read reply aloud."
       );
     } else {
-      status(
-        "Could not play the recording. Check the MP3 is uploaded, " +
-        "then tap Read reply aloud. " +
-        (error.message || "")
+      setAudioStatus(
+        "Could not play the recording. " + error.message
       );
     }
   } finally {
@@ -548,30 +821,246 @@ async function runPlayback(job) {
   }
 }
 
-function playClip(url) {
+// ============================================================
+// Web Audio playback
+// ============================================================
+
+function unlockAudio() {
+  // Must run synchronously inside a tap handler.
+  try {
+    const Context = window.AudioContext || window.webkitAudioContext;
+    if (!Context) return;
+
+    if (!audioCtx) {
+      audioCtx = new Context();
+      logVoice("Audio context created.");
+    }
+
+    if (audioCtx.state !== "running") {
+      const resumed = audioCtx.resume();
+      if (resumed && resumed.catch) resumed.catch(() => {});
+    }
+
+    // Silent blip, which also unlocks output on iOS.
+    const blip = audioCtx.createBufferSource();
+    blip.buffer = audioCtx.createBuffer(1, 1, 22050);
+    blip.connect(audioCtx.destination);
+    blip.start(0);
+  } catch (error) {
+    logVoice(`Audio unlock failed: ${error.name}: ${error.message}`);
+  }
+}
+
+async function loadBuffer(entry) {
+  if (bufferCache.has(entry.url)) return bufferCache.get(entry.url);
+
+  const response = await fetch(entry.url);
+
+  if (!response.ok) {
+    throw new Error(`Clip download failed: HTTP ${response.status}`);
+  }
+
+  const data = await response.arrayBuffer();
+
+  const buffer = await new Promise((resolve, reject) => {
+    const promise = audioCtx.decodeAudioData(data, resolve, reject);
+    if (promise && promise.catch) promise.catch(reject);
+  });
+
+  bufferCache.set(entry.url, buffer);
+  return buffer;
+}
+
+// Skips silence at the start and end of each recording so the
+// road name and duty join closely.
+function audibleRange(buffer) {
+  const data = buffer.getChannelData(0);
+  const threshold = 0.01;
+  let start = 0;
+  let end = data.length - 1;
+
+  while (start < end && Math.abs(data[start]) < threshold) start++;
+  while (end > start && Math.abs(data[end]) < threshold) end--;
+
+  const pad = Math.floor(buffer.sampleRate * 0.03);
+  start = Math.max(0, start - pad);
+  end = Math.min(data.length - 1, end + pad);
+
+  return {
+    offset: start / buffer.sampleRate,
+    duration: (end - start + 1) / buffer.sampleRate
+  };
+}
+
+function stopSources() {
+  const sources = activeSources;
+  activeSources = [];
+
+  sources.forEach(source => {
+    try {
+      source.onended = null;
+      source.stop();
+    } catch (error) {
+      // Already stopped.
+    }
+  });
+}
+
+async function playWithWebAudio(job, entries) {
+  if (audioCtx.state !== "running") {
+    try {
+      await audioCtx.resume();
+    } catch (error) {
+      logVoice(`Audio resume failed: ${error.name}`);
+    }
+  }
+
+  logVoice(`Audio context state: ${audioCtx.state}`);
+
+  if (audioCtx.state !== "running") {
+    throw new Error(`Audio context is ${audioCtx.state}`);
+  }
+
+  setAudioStatus("Loading recordings...");
+
+  const buffers = [];
+
+  for (const entry of entries) {
+    buffers.push(await loadBuffer(entry));
+
+    if (job.version !== playbackVersion) return false;
+  }
+
+  if (job.version !== playbackVersion) return false;
+
+  setAudioStatus(`Playing: ${entries.map(e => e.text).join(" ")}`);
+
+  return new Promise(resolve => {
+    let when = audioCtx.currentTime + 0.05;
+    let finished = false;
+    let timer;
+
+    function done(completed) {
+      if (finished) return;
+      finished = true;
+
+      clearTimeout(timer);
+      cancelCurrentClip = null;
+      activeSources = [];
+      resolve(completed);
+    }
+
+    cancelCurrentClip = () => {
+      stopSources();
+      done(false);
+    };
+
+    buffers.forEach((buffer, index) => {
+      const range = audibleRange(buffer);
+      const source = audioCtx.createBufferSource();
+
+      source.buffer = buffer;
+      source.connect(audioCtx.destination);
+      source.start(when, range.offset, range.duration);
+
+      if (index === buffers.length - 1) {
+        source.onended = () => done(true);
+      }
+
+      activeSources.push(source);
+      when += range.duration + CLIP_GAP_SECONDS;
+    });
+
+    timer = setTimeout(() => {
+      stopSources();
+      done(true);
+    }, (when - audioCtx.currentTime + 3) * 1000);
+  });
+}
+
+async function setMicReady(on) {
+  if (!on) {
+    if (micStream) {
+      micStream.getTracks().forEach(track => track.stop());
+      micStream = null;
+      logVoice("Microphone released.");
+    }
+
+    return;
+  }
+
+  if (micStream) return;
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: true
+    });
+
+    logVoice("Microphone held open.");
+  } catch (error) {
+    logVoice(`Hold microphone failed: ${error.name}`);
+    setMicStatus(`Could not hold the microphone: ${error.name}`);
+
+    if (micReadyToggle) micReadyToggle.checked = false;
+    saveSetting(MIC_READY_KEY, "false");
+  }
+}
+
+async function playWithElement(job) {
+  for (let index = 0; index < job.keys.length; index++) {
+    if (
+      job.version !== playbackVersion ||
+      document.hidden ||
+      micState !== "idle"
+    ) {
+      return false;
+    }
+
+    const entry = recording(job.keys[index]);
+    const next = recording(job.keys[index + 1] || "");
+
+    if (next) {
+      // Best-effort browser preloading.
+      nextAudio.src = next.url;
+      nextAudio.load();
+    }
+
+    const completed = await playClip(entry);
+
+    if (!completed || job.version !== playbackVersion) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function playClip(entry) {
   return new Promise((resolve, reject) => {
     let settled = false;
-    let timer = null;
+    let timer;
 
     function finish(error, completed) {
       if (settled) return;
       settled = true;
 
       clearTimeout(timer);
+      audio.onplaying = null;
       audio.onended = null;
       audio.onerror = null;
-      cancelClip = null;
+      cancelCurrentClip = null;
 
       if (!completed) audio.pause();
 
-      if (error) {
-        reject(error);
-      } else {
-        resolve(completed);
-      }
+      if (error) reject(error);
+      else resolve(completed);
     }
 
-    cancelClip = () => finish(null, false);
+    cancelCurrentClip = () => finish(null, false);
+
+    audio.onplaying = () => {
+      setAudioStatus(`Playing: ${entry.text}`);
+    };
 
     audio.onended = () => finish(null, true);
 
@@ -580,12 +1069,12 @@ function playClip(url) {
       finish(new Error(`Audio error ${code}.`), false);
     };
 
-    // A timeout is failure, not permission to restart listening.
     timer = setTimeout(() => {
-      finish(new Error("Audio playback timed out."), false);
-    }, 60000);
+      finish(new Error("Playback timed out."), false);
+    }, 90000);
 
-    audio.src = url;
+    setAudioStatus(`Loading: ${entry.text}`);
+    audio.src = entry.url;
 
     try {
       const promise = audio.play();
@@ -600,6 +1089,431 @@ function playClip(url) {
 }
 
 // ============================================================
+// Reusable speech recogniser
+// ============================================================
+
+function updateMicButton() {
+  if (micState === "idle") {
+    micBtn.textContent = "🎤 Speak";
+  } else if (micState === "starting") {
+    micBtn.textContent = "Cancel starting";
+  } else if (micState === "listening") {
+    micBtn.textContent = "Stop listening";
+  } else if (micState === "blocked") {
+    micBtn.textContent = "Microphone stuck — tap to reload";
+  } else {
+    micBtn.textContent = "Stopping...";
+  }
+}
+
+function clearMicTimers() {
+  clearTimeout(listenTimer);
+  clearTimeout(stopTimer);
+  clearTimeout(abortTimer);
+
+  listenTimer = null;
+  stopTimer = null;
+  abortTimer = null;
+}
+
+function setupRecognizer() {
+  if (!SpeechRec) {
+    micBtn.hidden = true;
+    setMicStatus("Voice recognition is unavailable in this browser.");
+    return;
+  }
+
+  try {
+    // Created ONCE, rather than once per search.
+    recognizer = new SpeechRec();
+    recognizer.lang = "en-GB";
+    recognizer.continuous = false;
+    recognizer.interimResults = false;
+    recognizer.maxAlternatives = 5;
+  } catch (error) {
+    logVoice(`Recognizer creation failed: ${error.message}`);
+    setMicStatus("Could not create the speech recogniser.");
+    return;
+  }
+
+  recognizer.onstart = () => {
+    if (!activeRun) {
+      logVoice("Unexpected recognition start without an active run.");
+
+      try {
+        recognizer.abort();
+      } catch (error) {
+        logVoice(`Abort failed: ${error.message}`);
+      }
+
+      return;
+    }
+
+    logVoice(`Run ${activeRun.id}: onstart.`);
+
+    if (
+      activeRun.discard ||
+      micState === "stopping" ||
+      micState === "blocked" ||
+      interactionMode !== "voice"
+    ) {
+      stopRecognition(true);
+      return;
+    }
+
+    micState = "listening";
+    updateMicButton();
+    transcript.textContent = "Listening...";
+    setMicStatus("Say a road, duty, or your answer.");
+
+    armListeningTimeout(activeRun.id);
+  };
+
+  recognizer.onaudiostart = () => {
+    logVoice(`Run ${activeRun?.id || "?"}: audiostart.`);
+  };
+
+  recognizer.onsoundstart = () => {
+    logVoice(`Run ${activeRun?.id || "?"}: soundstart.`);
+  };
+
+  recognizer.onspeechstart = () => {
+    logVoice(`Run ${activeRun?.id || "?"}: speechstart.`);
+  };
+
+  recognizer.onspeechend = () => {
+    logVoice(`Run ${activeRun?.id || "?"}: speechend.`);
+  };
+
+  recognizer.onaudioend = () => {
+    logVoice(`Run ${activeRun?.id || "?"}: audioend.`);
+  };
+
+  recognizer.onresult = event => {
+    const run = activeRun;
+
+    if (
+      !run ||
+      run.discard ||
+      run.alternatives ||
+      interactionMode !== "voice"
+    ) {
+      return;
+    }
+
+    for (
+      let index = event.resultIndex;
+      index < event.results.length;
+      index++
+    ) {
+      const result = event.results[index];
+      if (!result.isFinal) continue;
+
+      const alternatives = Array.from(
+        result,
+        item => item.transcript.trim()
+      ).filter(Boolean);
+
+      if (!alternatives.length) continue;
+
+      run.alternatives = alternatives;
+
+      transcript.textContent = `Heard: ${alternatives[0]}`;
+      logVoice(
+        `Run ${run.id}: final result (${alternatives.length} alternatives).`
+      );
+
+      // Process the words only AFTER onend.
+      stopRecognition(false);
+      break;
+    }
+  };
+
+  recognizer.onerror = event => {
+    const run = activeRun;
+    if (!run) return;
+
+    run.error = event.error;
+
+    logVoice(`Run ${run.id}: error ${event.error}.`);
+
+    if (!run.discard) {
+      if (event.error === "not-allowed") {
+        setMicStatus(
+          run.automatic
+            ? "Automatic listening was refused. Tap Speak."
+            : "Microphone access refused. Check browser permissions."
+        );
+      } else if (event.error === "audio-capture") {
+        setMicStatus(
+          "Microphone unavailable. Check other apps or audio devices."
+        );
+      } else if (event.error === "no-speech") {
+        setMicStatus("No speech recognised. Tap Speak to retry.");
+      } else if (event.error !== "aborted") {
+        setMicStatus(
+          `Recognition error: ${event.error}. Tap Speak to retry.`
+        );
+      }
+    }
+
+    // An error is not proof that the session has ended.
+    // Keep waiting for onend, with a bounded stop watchdog.
+    stopRecognition(false);
+  };
+
+  recognizer.onend = () => {
+    const run = activeRun;
+
+    logVoice(`Run ${run?.id || "?"}: onend.`);
+    clearMicTimers();
+
+    activeRun = null;
+    micState = "idle";
+    micReleasedAt = Date.now();
+
+    updateMicButton();
+
+    if (
+      run &&
+      !run.discard &&
+      run.alternatives &&
+      interactionMode === "voice" &&
+      !document.hidden
+    ) {
+      setMicStatus("");
+
+      try {
+        // Recognition has now actually ended.
+        handleVoice(run.alternatives);
+      } catch (error) {
+        console.error(error);
+        logVoice(`Input processing failed: ${error.message}`);
+        stopPlayback();
+        setMicStatus("Could not process that request. Tap Speak.");
+      }
+    } else if (
+      run &&
+      !run.discard &&
+      !run.error &&
+      !run.timedOut
+    ) {
+      transcript.textContent = "Nothing recognised.";
+      setMicStatus("Tap Speak to try again.");
+    } else if (run?.discard) {
+      setMicStatus("");
+    }
+
+    if (queuedReply) flushPlayback();
+  };
+
+  micBtn.onclick = () => {
+    if (micState === "blocked") {
+      logVoice("Reloading because recognition is stuck.");
+      location.reload();
+      return;
+    }
+
+    unlockAudio();
+
+    if (
+      readSetting(MIC_READY_KEY) === "true" &&
+      !micStream &&
+      micState === "idle"
+    ) {
+      setMicReady(true);
+    }
+
+    if (micState !== "idle") {
+      enterTextMode(false);
+      return;
+    }
+
+    stopPlayback(true);
+    interactionMode = "voice";
+    startListening(false);
+  };
+}
+
+function armListeningTimeout(id) {
+  clearTimeout(listenTimer);
+
+  listenTimer = setTimeout(() => {
+    if (!activeRun || activeRun.id !== id) return;
+
+    activeRun.timedOut = true;
+    activeRun.discard = true;
+
+    logVoice(`Run ${id}: listening/start timeout.`);
+
+    setMicStatus(
+      "Listening timed out. Stopping the microphone..."
+    );
+
+    // No recognised result is expected now, so abort.
+    stopRecognition(true);
+  }, LISTEN_TIMEOUT_MS);
+}
+
+function armStopWatchdog(run) {
+  if (stopTimer || abortTimer) return;
+
+  stopTimer = setTimeout(() => {
+    stopTimer = null;
+
+    if (activeRun !== run) return;
+
+    run.discard = true;
+    logVoice(`Run ${run.id}: no onend; requesting abort.`);
+
+    setMicStatus(
+      "Recognition has not ended. Attempting to cancel it..."
+    );
+
+    abortTimer = setTimeout(() => {
+      abortTimer = null;
+
+      if (activeRun !== run) return;
+
+      micState = "blocked";
+      updateMicButton();
+
+      logVoice(
+        `Run ${run.id}: still no onend; reload required.`
+      );
+
+      setMicStatus(
+        "The browser has not released recognition. " +
+        "Reload the page. Reset cannot repair this browser state."
+      );
+
+      // Do not mark idle or create a second recogniser.
+    }, STOP_TIMEOUT_MS);
+
+    try {
+      recognizer.abort();
+    } catch (error) {
+      logVoice(`Abort exception: ${error.name}: ${error.message}`);
+    }
+  }, STOP_TIMEOUT_MS);
+}
+
+function stopRecognition(discard = false) {
+  const run = activeRun;
+  if (!recognizer || !run) return;
+
+  if (discard) {
+    run.discard = true;
+    run.alternatives = null;
+  }
+
+  clearTimeout(listenTimer);
+  listenTimer = null;
+
+  if (micState === "blocked") return;
+
+  const alreadyStopping = micState === "stopping";
+  micState = "stopping";
+  updateMicButton();
+
+  // Arm before calling stop/abort in case events arrive quickly.
+  armStopWatchdog(run);
+
+  try {
+    if (discard && !run.abortRequested) {
+      run.abortRequested = true;
+      logVoice(`Run ${run.id}: abort requested.`);
+      recognizer.abort();
+    } else if (!discard && !alreadyStopping) {
+      logVoice(`Run ${run.id}: stop requested.`);
+      recognizer.stop();
+    }
+  } catch (error) {
+    logVoice(
+      `Run ${run.id}: stop exception ${error.name}: ${error.message}`
+    );
+  }
+}
+
+function startListening(automatic) {
+  if (
+    !recognizer ||
+    !ready ||
+    document.hidden ||
+    interactionMode !== "voice" ||
+    micState !== "idle" ||
+    activeRun ||
+    playbackActive ||
+    queuedReply ||
+    (automatic && !autoToggle.checked)
+  ) {
+    logVoice(
+      `Start skipped: state=${micState}, ` +
+      `mode=${interactionMode}, playback=${playbackActive}.`
+    );
+    return;
+  }
+
+  clearMicTimers();
+
+  const run = {
+    id: ++runNumber,
+    automatic,
+    discard: false,
+    alternatives: null,
+    error: null,
+    timedOut: false,
+    abortRequested: false
+  };
+
+  activeRun = run;
+  micState = "starting";
+
+  updateMicButton();
+  transcript.textContent = "Starting microphone...";
+  setMicStatus("");
+  setAudioStatus("");
+
+  logVoice(
+    `Run ${run.id}: start requested (${automatic ? "automatic" : "tap"}).`
+  );
+
+  // Covers start requests which never produce onstart.
+  armListeningTimeout(run.id);
+
+  try {
+    recognizer.start();
+  } catch (error) {
+    logVoice(
+      `Run ${run.id}: start exception ${error.name}: ${error.message}`
+    );
+
+    if (error.name === "InvalidStateError") {
+      // Browser says recognition is already active.
+      // Do not simply overwrite the state with "idle".
+      run.discard = true;
+
+      setMicStatus(
+        "The browser reports recognition is already active. " +
+        "Attempting to cancel it..."
+      );
+
+      stopRecognition(true);
+    } else {
+      // The requested session did not start.
+      clearMicTimers();
+      activeRun = null;
+      micState = "idle";
+      updateMicButton();
+
+      setMicStatus(
+        `Could not start: ${error.name}. ${error.message}`
+      );
+    }
+  }
+}
+
+// ============================================================
 // CSV parsing
 // ============================================================
 
@@ -609,20 +1523,20 @@ function splitCsvLine(line) {
   let quoted = false;
 
   for (let index = 0; index < line.length; index++) {
-    const ch = line[index];
+    const character = line[index];
 
-    if (ch === '"') {
+    if (character === '"') {
       if (quoted && line[index + 1] === '"') {
         value += '"';
         index++;
       } else {
         quoted = !quoted;
       }
-    } else if (ch === "," && !quoted) {
+    } else if (character === "," && !quoted) {
       columns.push(value);
       value = "";
     } else {
-      value += ch;
+      value += character;
     }
   }
 
@@ -638,7 +1552,7 @@ function parseCsv(text) {
     .slice(1);
 
   const entries = [];
-  let entryArea = "ME10";
+  let area = "ME10";
 
   for (const line of lines) {
     const columns = splitCsvLine(line);
@@ -646,10 +1560,7 @@ function parseCsv(text) {
     const walk = (columns[2] || "").trim();
 
     if (!road) {
-      if (entries.length && entryArea === "ME10") {
-        entryArea = "ME9";
-      }
-
+      if (entries.length && area === "ME10") area = "ME9";
       continue;
     }
 
@@ -660,13 +1571,13 @@ function parseCsv(text) {
       normalise(road.replace(/^THE\s+/i, ""))[0] ||
       "";
 
-    entries.push(makeEntry(road, walk, letter, entryArea));
+    entries.push(makeEntry(road, walk, letter, area));
   }
 
   return entries;
 }
 
-function makeEntry(road, walk, letter, entryArea) {
+function makeEntry(road, walk, letter, area) {
   const separator = road.indexOf(" - ");
   let base;
   let detail;
@@ -730,7 +1641,7 @@ function makeEntry(road, walk, letter, entryArea) {
     road,
     walk,
     letter,
-    area: entryArea,
+    area,
     base,
     detail,
     baseN: normalise(base),
@@ -761,15 +1672,17 @@ function normalise(value) {
 function walkKey(value) {
   const text = normalise(value);
   const match = text.match(/^[TUZ]?(\d+)$/);
+
   return match ? String(parseInt(match[1], 10)) : text;
 }
 
 function areaRoads() {
-  return roads.filter(entry => entry.area === area);
+  return roads.filter(entry => entry.area === selectedArea);
 }
 
 function findWalk(query) {
   const key = walkKey(query);
+
   return key
     ? areaRoads().filter(entry => walkKey(entry.walk) === key)
     : [];
@@ -787,6 +1700,24 @@ function findRoads(query, list = areaRoads()) {
 
   return text.length >= 4
     ? list.filter(entry => entry.baseN.includes(text))
+    : [];
+}
+
+function findExactVoiceRoad(query) {
+  const text = normalise(query);
+  const exact = areaRoads().filter(entry => entry.baseN === text);
+
+  if (exact.length) return exact;
+
+  const core = coreName(query);
+  if (core.length < 3) return [];
+
+  const matches = areaRoads().filter(
+    entry => coreName(entry.base) === core
+  );
+
+  return new Set(matches.map(entry => entry.baseN)).size === 1
+    ? matches
     : [];
 }
 
@@ -812,7 +1743,7 @@ function housesMatch(entry, number) {
   );
 }
 
-function answerPending(query) {
+function answerPending(query, allowFallback = true) {
   if (!pending) return null;
 
   const text = normalise(query);
@@ -846,7 +1777,7 @@ function answerPending(query) {
     return null;
   }
 
-  if (!hits.length) {
+  if (!hits.length && allowFallback) {
     hits = pending.matches.filter(entry => entry.fallback);
   }
 
@@ -937,16 +1868,16 @@ function suggestRoads(alternatives) {
 // ============================================================
 
 function applyArea() {
-  me10Tab.classList.toggle("active", area === "ME10");
-  me9Tab.classList.toggle("active", area === "ME9");
-  areaLabel.textContent = area;
+  me10Tab.classList.toggle("active", selectedArea === "ME10");
+  me9Tab.classList.toggle("active", selectedArea === "ME9");
+  areaLabel.textContent = selectedArea;
 }
 
 function setArea(name) {
   if (!ready) return;
 
   stopPlayback(true);
-  area = name;
+  selectedArea = name;
   pending = null;
   suggestions = null;
 
@@ -961,10 +1892,12 @@ function setArea(name) {
   } else {
     input.value = "";
     clearResults();
-    note(`Showing ${area}. Type or say a road name.`);
 
-    // There is no recorded area-announcement clip.
-    if (mode === "voice") {
+    showNote(
+      `Showing ${selectedArea}. Type or say a road name.`
+    );
+
+    if (interactionMode === "voice") {
       reply("prompt:retry", true);
     }
   }
@@ -989,13 +1922,18 @@ function buildGrids() {
   letters.forEach(letter => {
     addButton(letterGrid, letter, () => {
       enterTextMode();
-      showDuties(areaRoads().filter(entry => entry.letter === letter));
+
+      showDuties(
+        areaRoads().filter(entry => entry.letter === letter)
+      );
     });
   });
 
   const walks = [
     ...new Set(areaRoads().map(entry => walkKey(entry.walk)))
-  ].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  ].sort((a, b) =>
+    a.localeCompare(b, undefined, { numeric: true })
+  );
 
   walks.forEach(walk => {
     addButton(walkGrid, walk, () => {
@@ -1007,8 +1945,8 @@ function buildGrids() {
 
 function switchMode(name) {
   pending = null;
-
   const isRoad = name === "road";
+
   roadTab.classList.toggle("active", isRoad);
   walkTab.classList.toggle("active", !isRoad);
   letterGrid.classList.toggle("hidden", !isRoad);
@@ -1020,6 +1958,7 @@ function switchMode(name) {
 function clearResults() {
   suggestions = null;
   results.innerHTML = "";
+
   letterGrid.classList.remove("compact");
   walkGrid.classList.remove("compact");
   clearReply();
@@ -1030,19 +1969,23 @@ function compact() {
   walkGrid.classList.add("compact");
 }
 
-function note(text) {
-  const row = document.createElement("li");
-  row.className = "note";
-  row.textContent = text;
-  results.replaceChildren(row);
-  clearReply();
-}
-
 function appendNote(text) {
   const row = document.createElement("li");
   row.className = "note";
   row.textContent = text;
   results.appendChild(row);
+}
+
+function showNote(text) {
+  results.innerHTML = "";
+  appendNote(text);
+  clearReply();
+}
+
+function sortedEntries(matches) {
+  return [...matches].sort((a, b) =>
+    a.road.localeCompare(b.road)
+  );
 }
 
 function resultRow(entry) {
@@ -1066,9 +2009,36 @@ function resultRow(entry) {
   return row;
 }
 
+function appendEntries(matches) {
+  sortedEntries(matches).forEach(entry => {
+    results.appendChild(resultRow(entry));
+  });
+}
+
+function resultAudioKeys(matches) {
+  const keys = [];
+
+  for (const entry of sortedEntries(matches)) {
+    const roadKey = roadRecordingKey(entry);
+    const dutyKey = `duty:${walkKey(entry.walk)}`;
+    const fullResultKey = resultRecordingKey(entry);
+
+    if (recording(roadKey) && recording(dutyKey)) {
+      keys.push(roadKey, dutyKey);
+    } else if (recording(fullResultKey)) {
+      keys.push(fullResultKey);
+    } else {
+      keys.push(roadKey, dutyKey);
+    }
+  }
+
+  return keys;
+}
+
 function showDuties(matches) {
   pending = null;
   suggestions = null;
+
   compact();
   results.innerHTML = "";
 
@@ -1078,37 +2048,36 @@ function showDuties(matches) {
     return;
   }
 
-  [...matches]
-    .sort((a, b) => a.road.localeCompare(b.road))
-    .forEach(entry => results.appendChild(resultRow(entry)));
+  appendEntries(matches);
 
-  const duties = [
-    ...new Set(matches.map(entry => walkKey(entry.walk)))
-  ];
-
-  // Recordings contain duty announcements, not standalone
-  // road names. Keep the road/detail information on screen.
-  if (duties.length <= 5) {
-    reply(duties.map(duty => `duty:${duty}`));
+  if (matches.length <= MAX_READ_RESULTS) {
+    reply(resultAudioKeys(matches));
   } else {
     clearReply();
 
-    if (mode === "voice") {
-      status("Multiple results. See the screen for their duties.");
-    }
+    setAudioStatus(
+      `${matches.length} results shown. Narrow the search ` +
+      `to ${MAX_READ_RESULTS} or fewer to read them aloud.`
+    );
   }
 }
 
 function askDetail(matches, message) {
-  if (mode !== "voice") {
+  if (interactionMode !== "voice") {
     showDuties(matches);
     return;
   }
 
   suggestions = null;
   pending = { matches };
+
   compact();
-  note(message);
+  results.innerHTML = "";
+
+  // Results stay visible beneath the clarification question.
+  appendNote(message);
+  appendEntries(matches);
+
   reply("prompt:detail", true);
 }
 
@@ -1147,6 +2116,14 @@ function reset() {
   suggestions = null;
   input.value = "";
   clearResults();
+
+  logVoice("Reset pressed.");
+
+  if (micState === "blocked") {
+    setMicStatus(
+      "Recognition is still stuck in the browser. Reload the page."
+    );
+  }
 }
 
 // ============================================================
@@ -1155,6 +2132,7 @@ function reset() {
 
 function offerOptions(options) {
   pending = null;
+
   suggestions = {
     options,
     stage: "choose",
@@ -1188,9 +2166,14 @@ function renderChoose() {
   option("None of these", cancelSuggestions, true);
 
   if (options.length === 1) {
+    appendEntries(
+      areaRoads().filter(entry =>
+        entry.baseN === options[0].baseN
+      )
+    );
+
     reply(`confirm:${options[0].base}`, true);
   } else {
-    // No numbered road-name recordings exist in the manifest.
     reply("prompt:choose", true);
   }
 }
@@ -1223,10 +2206,15 @@ function renderConfirm() {
 
   option("No, choose again", () => {
     if (!suggestions) return;
+
     suggestions.stage = "choose";
     suggestions.chosen = -1;
     renderChoose();
   }, true);
+
+  appendEntries(
+    areaRoads().filter(entry => entry.baseN === candidate.baseN)
+  );
 
   reply(`confirm:${candidate.base}`, true);
 }
@@ -1244,7 +2232,8 @@ function cancelSuggestions() {
   suggestions = null;
   pending = null;
   input.value = "";
-  note("Okay. Type or say the road again.");
+
+  showNote("Okay. Type or say the road again.");
   reply("prompt:retry", true);
 }
 
@@ -1256,12 +2245,12 @@ function handleSuggestion(alternatives) {
   for (const raw of alternatives) {
     const said = cleanSpoken(raw);
 
-    if (CANCEL.has(said)) {
+    if (CANCEL_WORDS.has(said)) {
       cancelSuggestions();
       return true;
     }
 
-    if (YES.has(said)) {
+    if (YES_WORDS.has(said)) {
       if (stage === "confirm") {
         acceptOption(chosen);
       } else if (options.length === 1) {
@@ -1273,7 +2262,7 @@ function handleSuggestion(alternatives) {
       return true;
     }
 
-    if (NO.has(said)) {
+    if (NO_WORDS.has(said)) {
       if (stage === "confirm") {
         suggestions.stage = "choose";
         suggestions.chosen = -1;
@@ -1315,6 +2304,7 @@ function handleSuggestion(alternatives) {
 
 function areaFromText(text) {
   const value = normalise(text);
+
   return value === "ME10" || value === "ME9" ? value : null;
 }
 
@@ -1330,25 +2320,31 @@ function handleInput(raw, final) {
   }
 
   if (suggestions) {
-    if (!final) return;
-    if (handleSuggestion([query])) return;
+    if (final && handleSuggestion([query])) return;
     suggestions = null;
   }
 
+  const requestedArea = areaFromText(query);
+
+  if (requestedArea) {
+    if (final) {
+      input.value = requestedArea;
+      setArea(requestedArea);
+    } else {
+      clearResults();
+    }
+
+    return;
+  }
+
   if (pending) {
-    const matches = pending.matches;
+    const openQuestion = pending;
     const hits = answerPending(query);
 
     if (hits) {
       showDuties(hits);
-      return;
-    }
 
-    const requestedArea = areaFromText(query);
-
-    if (requestedArea && final) {
-      input.value = requestedArea;
-      setArea(requestedArea);
+      if (!final) pending = openQuestion;
       return;
     }
 
@@ -1356,23 +2352,13 @@ function handleInput(raw, final) {
       /^\d/.test(normalise(query)) ||
       /^[A-Z]{1,2}\d/.test(normalise(query))
     ) {
-      showDuties(matches);
+      showDuties(openQuestion.matches);
+
+      if (!final) pending = openQuestion;
       return;
     }
 
     pending = null;
-  }
-
-  const requestedArea = areaFromText(query);
-
-  if (requestedArea) {
-    if (final) {
-      setArea(requestedArea);
-    } else {
-      clearResults();
-    }
-
-    return;
   }
 
   if (!final && query.length < 3 && !findWalk(query).length) {
@@ -1394,14 +2380,15 @@ function lookup(query) {
   const matches = findRoads(query);
 
   if (matches.length) {
-    if (mode === "voice" && needsDetail(matches)) {
+    if (
+      interactionMode === "voice" &&
+      needsDetail(matches)
+    ) {
       askDetail(
         matches,
-        `${matches[0].base} has ${matches.length} entries. ` +
-        "Which house number or postcode?"
+        `${matches[0].base}: which house number or postcode?`
       );
     } else {
-      // Typed searches always show every matching entry.
       showDuties(matches);
     }
 
@@ -1410,33 +2397,29 @@ function lookup(query) {
 
   const elsewhere = findRoads(
     query,
-    roads.filter(entry => entry.area !== area)
+    roads.filter(entry => entry.area !== selectedArea)
   );
 
   if (elsewhere.length) {
     pending = null;
     suggestions = null;
 
-    note(
-      `Not in ${area}. Found in ${elsewhere[0].area}. ` +
+    showNote(
+      `Not in ${selectedArea}. Found in ${elsewhere[0].area}. ` +
       "Select that area to search there."
     );
 
-    // There is no matching recorded area-switch sentence.
     return;
   }
 
   const options = suggestRoads([query]);
 
-  if (options.length) {
-    offerOptions(options);
-  } else {
-    showDuties([]);
-  }
+  if (options.length) offerOptions(options);
+  else showDuties([]);
 }
 
 // ============================================================
-// Voice interpretation
+// Spoken-text interpretation
 // ============================================================
 
 function cleanSpoken(value) {
@@ -1447,16 +2430,7 @@ function cleanSpoken(value) {
     .trim();
 }
 
-function heardAsNumber(raw) {
-  const text = cleanSpoken(raw).replace(
-    /^(number|option|house number|house|the) /,
-    ""
-  );
-
-  if (Object.prototype.hasOwnProperty.call(NUMBER_ALIASES, text)) {
-    return NUMBER_ALIASES[text];
-  }
-
+function wordsToDigits(text) {
   const words = text.split(/\s+/);
   const output = [];
 
@@ -1479,19 +2453,117 @@ function heardAsNumber(raw) {
     }
   }
 
-  return output.join(" ")
+  return output.join(" ");
+}
+
+function heardAsNumber(raw) {
+  const text = cleanSpoken(raw).replace(
+    /^(number|option|house number|house) /,
+    ""
+  );
+
+  if (Object.prototype.hasOwnProperty.call(NUMBER_ALIASES, text)) {
+    return NUMBER_ALIASES[text];
+  }
+
+  return wordsToDigits(text)
     .replace(/\b(you|u)\s*(\d)/gi, "U$2")
     .replace(/\b(tea|tee|t)\s*(\d)/gi, "T$2")
     .replace(/\b(zed|zee|said|z)\s*(\d)/gi, "Z$2");
 }
 
+function postcodeVariant(raw) {
+  let text = cleanSpoken(raw)
+    .replace(/^(the )?(postcode|post code)\s+/, "")
+    .replace(/\bx ray\b/g, "xray")
+    .replace(/\bdouble u\b/g, "doubleyou");
+
+  text = wordsToDigits(text);
+
+  const tokens = text.split(/\s+/).map(token =>
+    NATO_LETTERS[token] || SPOKEN_LETTERS[token] || token
+  );
+
+  const value = normalise(tokens.join(" "));
+
+  return /^(?:ME(?:9|10)(?:\d[A-Z]{0,2})?|\d[A-Z]{2})$/.test(
+    value
+  ) ? value : null;
+}
+
+function detailAlternatives(alternatives) {
+  const values = [];
+
+  for (const raw of alternatives) {
+    values.push(heardAsNumber(raw), raw);
+
+    const postcode = postcodeVariant(raw);
+    if (postcode) values.push(postcode);
+  }
+
+  return [...new Set(values.filter(Boolean))];
+}
+
 function handleVoice(alternatives) {
-  if (mode !== "voice" || !ready) return;
+  if (interactionMode !== "voice" || !ready) return;
 
   if (suggestions && handleSuggestion(alternatives)) return;
   suggestions = null;
 
   const spoken = alternatives.map(heardAsNumber);
+
+  if (pending) {
+    const candidates = detailAlternatives(alternatives);
+
+    for (const text of candidates) {
+      const hits = answerPending(text, false);
+
+      if (!hits) continue;
+
+      input.value = text;
+
+      if (
+        new Set(hits.map(entry => walkKey(entry.walk))).size > 1
+      ) {
+        askDetail(
+          hits,
+          "More than one match. Which house number or postcode?"
+        );
+      } else {
+        showDuties(hits);
+      }
+
+      return;
+    }
+
+    const anotherRoad = spoken.find(
+      text => findExactVoiceRoad(text).length
+    );
+
+    if (anotherRoad) {
+      pending = null;
+      input.value = anotherRoad;
+      lookup(anotherRoad);
+      return;
+    }
+
+    for (const text of candidates) {
+      const hits = answerPending(text, true);
+
+      if (hits) {
+        input.value = text;
+        showDuties(hits);
+        return;
+      }
+    }
+
+    askDetail(
+      pending.matches,
+      "No clear match. Which house number or postcode?"
+    );
+
+    return;
+  }
 
   for (const text of spoken) {
     const requestedArea = areaFromText(text);
@@ -1503,287 +2575,51 @@ function handleVoice(alternatives) {
     }
   }
 
-  if (pending) {
-    for (const text of spoken) {
-      const hits = answerPending(text);
-
-      if (hits) {
-        input.value = text;
-        showDuties(hits);
-        return;
-      }
-    }
-
-    // Keep the question open unless a different road was said.
-    const differentRoad = spoken.find(text => findRoads(text).length);
-
-    if (!differentRoad) {
-      reply("prompt:detail", true);
-      return;
-    }
-
-    pending = null;
-  }
-
   for (const text of spoken) {
-    const command = text.match(/^(walk|letter)\s+(.+)$/i);
+    const command = text.match(/^(walk|duty|letter)\s+(.+)$/i);
     if (!command) continue;
 
-    if (command[1].toLowerCase() === "walk") {
-      switchMode("walk");
-      input.value = command[2];
-      showDuties(findWalk(command[2]));
-    } else {
+    if (command[1].toLowerCase() === "letter") {
       switchMode("road");
       const letter = normalise(command[2])[0];
 
       showDuties(
         areaRoads().filter(entry => entry.letter === letter)
       );
+    } else {
+      switchMode("walk");
+      input.value = command[2];
+      showDuties(findWalk(command[2]));
     }
 
     return;
   }
 
-  const direct = spoken.find(text =>
-    findRoads(text).length || findWalk(text).length
-  );
+  for (const text of spoken) {
+    const matches = findExactVoiceRoad(text);
 
-  if (direct) {
-    input.value = direct;
-    lookup(direct);
-    return;
+    if (matches.length) {
+      input.value = matches[0].base;
+      lookup(matches[0].base);
+      return;
+    }
+  }
+
+  for (const text of spoken) {
+    if (findWalk(text).length) {
+      input.value = text;
+      showDuties(findWalk(text));
+      return;
+    }
   }
 
   input.value = spoken[0] || "";
+
   const options = suggestRoads(alternatives);
 
   if (options.length) {
     offerOptions(options);
   } else {
-    note("No road found. Type a road or tap Speak to retry.");
-    reply("prompt:no-match", true);
-  }
-}
-
-// ============================================================
-// Microphone
-// ============================================================
-
-function updateMic() {
-  micBtn.textContent = micState === "idle"
-    ? "🎤 Speak"
-    : micState === "stopping"
-      ? "Stopping..."
-      : "Stop listening";
-}
-
-function setupMic() {
-  if (!SpeechRec) {
-    micBtn.hidden = true;
-    return;
-  }
-
-  micBtn.onclick = () => {
-    if (micState !== "idle") {
-      enterTextMode(false);
-      return;
-    }
-
-    stopPlayback(true);
-    mode = "voice";
-    startListening(false);
-  };
-}
-
-function stopRecognition(discard = false) {
-  if (!recognizer || micState === "idle") return;
-
-  const session = recognizer;
-  const wasStopping = micState === "stopping";
-
-  if (discard) session.ignoreResults = true;
-
-  micState = "stopping";
-  updateMic();
-
-  try {
-    if (discard) {
-      session.abort();
-    } else if (!wasStopping) {
-      session.stop();
-    }
-  } catch (error) {
-    console.warn(error);
-  }
-
-  if (stopTimer) return;
-
-  stopTimer = setTimeout(() => {
-    stopTimer = null;
-
-    if (recognizer !== session || micState === "idle") return;
-
-    session.ignoreResults = true;
-
-    try {
-      session.abort();
-    } catch (error) {
-      console.warn(error);
-    }
-
-    status(
-      "Safari has not reported that the microphone stopped. " +
-      "Reload the page if it stays stuck."
-    );
-  }, 6000);
-}
-
-function startListening(automatic) {
-  if (
-    !SpeechRec ||
-    !ready ||
-    mode !== "voice" ||
-    micState !== "idle" ||
-    playbackActive ||
-    queuedReply ||
-    document.hidden ||
-    (automatic && !autoToggle.checked)
-  ) {
-    return;
-  }
-
-  let session;
-
-  try {
-    session = new SpeechRec();
-  } catch (error) {
-    status("Could not initialise the microphone.");
-    return;
-  }
-
-  recognizer = session;
-  session.ignoreResults = false;
-  session.lang = "en-GB";
-  session.continuous = false;
-  session.interimResults = false;
-  session.maxAlternatives = 5;
-
-  let gotResult = false;
-  let hadError = false;
-
-  session.onstart = () => {
-    if (recognizer !== session) return;
-
-    if (micState === "stopping" || mode !== "voice") {
-      session.ignoreResults = true;
-
-      try {
-        session.abort();
-      } catch (error) {
-        console.warn(error);
-      }
-
-      return;
-    }
-
-    micState = "listening";
-    updateMic();
-    transcript.textContent = "Listening...";
-  };
-
-  session.onresult = event => {
-    if (
-      recognizer !== session ||
-      session.ignoreResults ||
-      gotResult ||
-      mode !== "voice"
-    ) {
-      return;
-    }
-
-    const result = event.results[event.resultIndex];
-    if (!result || !result.isFinal) return;
-
-    const alternatives = Array.from(
-      result,
-      item => item.transcript.trim()
-    ).filter(Boolean);
-
-    if (!alternatives.length) return;
-
-    gotResult = true;
-    transcript.textContent = `Heard: ${alternatives[0]}`;
-
-    try {
-      handleVoice(alternatives);
-    } catch (error) {
-      console.error(error);
-      stopPlayback();
-      status("Could not process that request. Tap Speak to retry.");
-    } finally {
-      stopRecognition();
-    }
-  };
-
-  session.onerror = event => {
-    if (recognizer !== session) return;
-
-    hadError = true;
-    if (session.ignoreResults || mode !== "voice") return;
-
-    if (event.error === "not-allowed") {
-      transcript.textContent = automatic
-        ? "Tap Speak to answer."
-        : "Microphone access denied. Check Safari permissions.";
-    } else if (event.error === "no-speech") {
-      transcript.textContent = "Nothing heard. Tap Speak to retry.";
-    } else if (event.error !== "aborted" || !gotResult) {
-      transcript.textContent =
-        `Voice input: ${event.error}. Tap Speak to retry.`;
-    }
-  };
-
-  session.onend = () => {
-    if (recognizer !== session) return;
-
-    clearTimeout(stopTimer);
-    stopTimer = null;
-
-    recognizer = null;
-    micState = "idle";
-    micReleasedAt = Date.now();
-    updateMic();
-
-    if (
-      !gotResult &&
-      !hadError &&
-      !session.ignoreResults &&
-      mode === "voice"
-    ) {
-      transcript.textContent = "Nothing heard. Tap Speak to retry.";
-    }
-
-    if (queuedReply) {
-      flushPlayback();
-    }
-  };
-
-  micState = "starting";
-  updateMic();
-  transcript.textContent = "Starting microphone...";
-  status("");
-
-  try {
-    session.start();
-  } catch (error) {
-    if (recognizer === session) {
-      recognizer = null;
-      micState = "idle";
-      updateMic();
-    }
-
-    transcript.textContent =
-      "Could not start listening. Tap Speak to retry.";
+    lookup(spoken[0] || "");
   }
 }
