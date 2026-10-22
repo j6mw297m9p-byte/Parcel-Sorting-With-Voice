@@ -4,21 +4,13 @@
 // Settings
 // ============================================================
 
-const PAUSE_MS = 900;
-const SPEECH_RATE = 1;
-const MIN_SUGGEST = 0.6;
 const AREA_KEY = "sortingArea";
-const AUTO_LISTEN_KEY = "sortingAutoListen";
+const AUTO_KEY = "sortingAutoListen";
+const HANDOVER_MS = 600;
+const MIN_SUGGEST = 0.6;
 
-const AUDIO_HANDOVER_MS = 600;
-const MIC_STOP_WARNING_MS = 6000;
-
-const AREA_SPOKEN = {
-  ME10: "M E ten",
-  ME9: "M E nine"
-};
-
-const ORDINAL = ["One", "Two", "Three", "Four", "Five"];
+const SpeechRec =
+  window.SpeechRecognition || window.webkitSpeechRecognition;
 
 const SUFFIXES = new Set([
   "ROAD", "RD", "STREET", "ST", "AVENUE", "AVE",
@@ -27,353 +19,162 @@ const SUFFIXES = new Set([
   "PARK", "WALK", "PLACE", "MEWS", "RISE", "HOUSE", "THE"
 ]);
 
-const YES_WORDS = new Set([
+const YES = new Set([
   "yes", "yeah", "yep", "yup", "correct", "right",
   "thats right", "thats it", "that one", "ok",
   "okay", "sure", "confirm"
 ]);
 
-const NO_WORDS = new Set([
+const NO = new Set([
   "no", "nope", "wrong", "incorrect", "not that"
 ]);
 
-const CANCEL_WORDS = new Set([
+const CANCEL = new Set([
   "none", "neither", "none of these", "cancel",
   "try again", "start again"
 ]);
 
-const NUMBER_ALIASES = {
-  won: "1",
-  wan: "1",
-  to: "2",
-  too: "2",
-  tu: "2",
-  tree: "3",
-  free: "3",
-  for: "4",
-  fore: "4",
-  ate: "8",
-  first: "1",
-  second: "2",
-  third: "3",
-  fourth: "4",
-  fifth: "5"
+const NUMBER_WORDS = {
+  oh: 0, zero: 0, one: 1, two: 2, three: 3,
+  four: 4, five: 5, six: 6, seven: 7, eight: 8,
+  nine: 9, ten: 10, eleven: 11, twelve: 12,
+  thirteen: 13, fourteen: 14, fifteen: 15,
+  sixteen: 16, seventeen: 17, eighteen: 18,
+  nineteen: 19, twenty: 20, thirty: 30, forty: 40,
+  fifty: 50, sixty: 60, seventy: 70, eighty: 80,
+  ninety: 90
 };
 
-const NUMBER_WORDS = {
-  oh: 0,
-  zero: 0,
-  one: 1,
-  two: 2,
-  three: 3,
-  four: 4,
-  five: 5,
-  six: 6,
-  seven: 7,
-  eight: 8,
-  nine: 9,
-  ten: 10,
-  eleven: 11,
-  twelve: 12,
-  thirteen: 13,
-  fourteen: 14,
-  fifteen: 15,
-  sixteen: 16,
-  seventeen: 17,
-  eighteen: 18,
-  nineteen: 19,
-  twenty: 20,
-  thirty: 30,
-  forty: 40,
-  fifty: 50,
-  sixty: 60,
-  seventy: 70,
-  eighty: 80,
-  ninety: 90
+const NUMBER_ALIASES = {
+  won: "1", wan: "1", to: "2", too: "2", tu: "2",
+  tree: "3", free: "3", for: "4", fore: "4",
+  ate: "8", first: "1", second: "2", third: "3",
+  fourth: "4", fifth: "5"
 };
 
 const HOUSES_AFTER_NAME =
   /^(.*?)\s+(\d{1,3}(?:-\d{1,3})?(?:\s+\d{1,3}(?:-\d{1,3})?)*)$/;
-
-const SpeechRec =
-  window.SpeechRecognition || window.webkitSpeechRecognition;
-
-const synth = window.speechSynthesis || null;
 
 // ============================================================
 // State
 // ============================================================
 
 let roads = [];
-let dataReady = false;
-let selectedArea = "ME10";
+let ready = false;
+let area = "ME10";
+let mode = "text";
 
 let pending = null;
 let suggestions = null;
-let typingTimer = null;
 
-// Text interactions never automatically speak.
-let interactionMode = "text";
+let manifest = new Map();
+let manifestReady = false;
 
-// Microphone states:
-// idle -> starting -> listening -> stopping -> idle
-let micState = "idle";
 let recognizer = null;
-let micStopTimer = null;
+let micState = "idle";
 let micReleasedAt = 0;
+let stopTimer = null;
 
-// Speech output.
+let audio = null;
+let playbackVersion = 0;
+let playbackActive = false;
 let queuedReply = null;
-let lastReply = "";
-let currentUtterance = null;
-let speechVersion = 0;
-let speechStartTimer = null;
-let speechWatchdog = null;
-let followUpTimer = null;
+let lastReply = null;
+let playbackTimer = null;
+let autoTimer = null;
+let cancelClip = null;
 
-// Page elements.
+let input;
+let micBtn;
+let transcript;
+let results;
 let letterGrid;
 let walkGrid;
-let results;
 let roadTab;
 let walkTab;
 let me10Tab;
 let me9Tab;
 let areaLabel;
-let input;
-let micBtn;
-let transcriptEl;
-let resetBtn;
-
-// Extra audio controls.
 let replayBtn;
 let audioStatus;
-let autoListenToggle;
+let autoToggle;
 
 // ============================================================
 // Startup
 // ============================================================
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
+  input = document.getElementById("roadSearch");
+  micBtn = document.getElementById("micBtn");
+  transcript = document.getElementById("transcript");
+  results = document.getElementById("results");
   letterGrid = document.getElementById("letterGrid");
   walkGrid = document.getElementById("walkGrid");
-  results = document.getElementById("results");
   roadTab = document.getElementById("roadTab");
   walkTab = document.getElementById("walkTab");
   me10Tab = document.getElementById("me10Tab");
   me9Tab = document.getElementById("me9Tab");
   areaLabel = document.getElementById("areaLabel");
-  input = document.getElementById("roadSearch");
-  micBtn = document.getElementById("micBtn");
-  transcriptEl = document.getElementById("transcript");
-  resetBtn = document.getElementById("resetBtn");
+
+  audio = new Audio();
+  audio.preload = "auto";
 
   createAudioControls();
+  setupMic();
 
   roadTab.onclick = () => {
-    beginTextInteraction();
+    enterTextMode();
     switchMode("road");
   };
 
   walkTab.onclick = () => {
-    beginTextInteraction();
+    enterTextMode();
     switchMode("walk");
   };
 
   me10Tab.onclick = () => {
-    beginTextInteraction();
+    enterTextMode();
     setArea("ME10");
   };
 
   me9Tab.onclick = () => {
-    beginTextInteraction();
+    enterTextMode();
     setArea("ME9");
   };
 
-  resetBtn.onclick = reset;
+  document.getElementById("resetBtn").onclick = reset;
 
   input.addEventListener("focus", () => {
-    beginTextInteraction(false);
+    enterTextMode(false);
   });
 
   input.addEventListener("input", () => {
-    beginTextInteraction();
-    handleInput(input.value, "live");
-
-    if (pending && isNumberOrPostcode(input.value)) {
-      typingTimer = setTimeout(() => {
-        typingTimer = null;
-        handleInput(input.value, "pause");
-      }, PAUSE_MS);
-    }
+    enterTextMode();
+    handleInput(input.value, false);
   });
 
   input.addEventListener("keydown", event => {
     if (event.key !== "Enter") return;
 
     event.preventDefault();
-    beginTextInteraction();
-    handleInput(input.value, "final");
+    enterTextMode();
+    handleInput(input.value, true);
   });
-
-  setupVoiceButton();
-  loadData();
 
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) return;
-
-    beginTextInteraction(false);
-    setAudioStatus("Paused. Tap Speak when you return.");
-  });
-
-  window.addEventListener("pagehide", () => {
-    beginTextInteraction(false);
-  });
-});
-
-function createAudioControls() {
-  const controls = document.createElement("div");
-  controls.style.margin = "10px 0";
-
-  replayBtn = document.createElement("button");
-  replayBtn.type = "button";
-  replayBtn.textContent = "Read reply aloud";
-  replayBtn.disabled = true;
-
-  Object.assign(replayBtn.style, {
-    padding: "10px 12px",
-    fontSize: "16px"
-  });
-
-  replayBtn.onclick = () => {
-    if (!lastReply) return;
-
-    const text = lastReply;
-
-    // Explicit playback does not restart the microphone.
-    beginTextInteraction(false);
-    speak(text);
-  };
-
-  const label = document.createElement("label");
-
-  Object.assign(label.style, {
-    display: "block",
-    marginTop: "10px"
-  });
-
-  autoListenToggle = document.createElement("input");
-  autoListenToggle.type = "checkbox";
-  autoListenToggle.checked =
-    readPreference(AUTO_LISTEN_KEY) !== "false";
-  autoListenToggle.style.marginRight = "8px";
-
-  autoListenToggle.addEventListener("change", () => {
-    writePreference(
-      AUTO_LISTEN_KEY,
-      String(autoListenToggle.checked)
-    );
-
-    if (!autoListenToggle.checked) {
-      clearTimeout(followUpTimer);
-      followUpTimer = null;
+    if (document.hidden) {
+      enterTextMode(false);
     }
   });
 
-  label.append(
-    autoListenToggle,
-    document.createTextNode(
-      "Listen automatically after voice questions"
-    )
-  );
-
-  audioStatus = document.createElement("p");
-  audioStatus.setAttribute("role", "status");
-  audioStatus.setAttribute("aria-live", "polite");
-
-  Object.assign(audioStatus.style, {
-    fontSize: "14px",
-    margin: "8px 0"
+  window.addEventListener("pagehide", () => {
+    enterTextMode(false);
   });
 
-  // No version/debug message is added.
-  controls.append(replayBtn, label, audioStatus);
-  transcriptEl.insertAdjacentElement("afterend", controls);
-}
-
-function setAudioStatus(message) {
-  if (audioStatus) {
-    audioStatus.textContent = message;
-  }
-}
-
-function readPreference(key) {
-  try {
-    return localStorage.getItem(key);
-  } catch (error) {
-    return null;
-  }
-}
-
-function writePreference(key, value) {
-  try {
-    localStorage.setItem(key, value);
-  } catch (error) {
-    // Saved preferences are optional.
-  }
-}
-
-// ============================================================
-// Interaction modes
-// ============================================================
-
-function beginTextInteraction(forgetReply = true) {
-  interactionMode = "text";
-
-  clearTimeout(typingTimer);
-  typingTimer = null;
-
-  cancelSpeech(forgetReply);
-  requestRecognitionStop(true);
-
-  if (transcriptEl) {
-    transcriptEl.textContent = "";
-  }
-
-  setAudioStatus("");
-}
-
-function beginVoiceInteraction() {
-  clearTimeout(typingTimer);
-  typingTimer = null;
-
-  cancelSpeech(true);
-  interactionMode = "voice";
-}
-
-function respond(text, onDone) {
-  rememberReply(text);
-
-  if (interactionMode === "voice") {
-    speak(text, onDone);
-  }
-}
-
-function rememberReply(text) {
-  lastReply = String(text || "").trim();
-
-  if (replayBtn) {
-    replayBtn.disabled = !synth || !lastReply;
-  }
-}
-
-// ============================================================
-// Loading and CSV parsing
-// ============================================================
-
-async function loadData() {
-  showNote("Loading roads...");
   micBtn.disabled = true;
+  note("Loading roads...");
+
+  const audioLoading = loadManifest();
 
   try {
     const response = await fetch("roads.csv");
@@ -385,30 +186,448 @@ async function loadData() {
     roads = parseCsv(await response.text());
 
     if (!roads.length) {
-      throw new Error("No usable road rows found in roads.csv.");
+      throw new Error("No usable roads found.");
     }
 
-    dataReady = true;
+    const saved = readSetting(AREA_KEY);
+    area = saved === "ME9" ? "ME9" : "ME10";
+    ready = true;
 
-    const saved = readPreference(AREA_KEY);
-    applyArea(saved === "ME9" ? "ME9" : "ME10");
-
+    applyArea();
     buildGrids();
     switchMode("road");
 
-    showNote(
-      `Showing ${selectedArea}. Type or say a road name.`
-    );
+    note(`Showing ${area}. Type or say a road name.`);
+  } catch (error) {
+    console.error(error);
+    note("Could not load roads.csv. Check the file and columns.");
+  }
+
+  await audioLoading;
+  micBtn.disabled = !ready;
+});
+
+function createAudioControls() {
+  const box = document.createElement("div");
+  box.style.margin = "10px 0";
+
+  replayBtn = document.createElement("button");
+  replayBtn.type = "button";
+  replayBtn.textContent = "Read reply aloud";
+  replayBtn.disabled = true;
+  replayBtn.style.padding = "10px 12px";
+  replayBtn.style.fontSize = "16px";
+
+  replayBtn.onclick = () => {
+    if (!lastReply) return;
+
+    const reply = lastReply;
+    enterTextMode(false);
+
+    // Explicit replay never automatically opens the mic.
+    requestPlayback(reply.keys, false);
+  };
+
+  const label = document.createElement("label");
+  label.style.display = "block";
+  label.style.marginTop = "10px";
+
+  autoToggle = document.createElement("input");
+  autoToggle.type = "checkbox";
+  autoToggle.checked = readSetting(AUTO_KEY) !== "false";
+  autoToggle.style.marginRight = "8px";
+
+  autoToggle.onchange = () => {
+    saveSetting(AUTO_KEY, String(autoToggle.checked));
+
+    if (!autoToggle.checked) {
+      clearTimeout(autoTimer);
+      autoTimer = null;
+    }
+  };
+
+  label.append(
+    autoToggle,
+    document.createTextNode(
+      "Listen automatically after voice questions"
+    )
+  );
+
+  audioStatus = document.createElement("p");
+  audioStatus.setAttribute("role", "status");
+  audioStatus.setAttribute("aria-live", "polite");
+  audioStatus.style.fontSize = "14px";
+  audioStatus.style.margin = "8px 0";
+
+  box.append(replayBtn, label, audioStatus);
+  transcript.insertAdjacentElement("afterend", box);
+}
+
+function status(text) {
+  audioStatus.textContent = text;
+}
+
+function readSetting(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch (error) {
+    return null;
+  }
+}
+
+function saveSetting(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (error) {
+    // Storage is optional.
+  }
+}
+
+// ============================================================
+// Audio manifest
+// ============================================================
+
+function clipKey(value) {
+  return String(value).trim().replace(/\s+/g, " ").toUpperCase();
+}
+
+async function loadManifest() {
+  try {
+    const response = await fetch("audio/manifest.json");
+
+    if (!response.ok) {
+      throw new Error(`manifest.json: HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    for (const [key, entry] of Object.entries(data)) {
+      if (
+        !entry ||
+        typeof entry.file !== "string" ||
+        typeof entry.text !== "string"
+      ) {
+        continue;
+      }
+
+      // Your manifest paths are relative to the app root,
+      // not relative to the manifest's audio folder.
+      const url = new URL(entry.file, document.baseURI);
+      const audioRoot = new URL("audio/", document.baseURI);
+
+      if (
+        url.origin !== audioRoot.origin ||
+        !url.pathname.startsWith(audioRoot.pathname) ||
+        !url.pathname.toLowerCase().endsWith(".mp3")
+      ) {
+        continue;
+      }
+
+      manifest.set(clipKey(key), {
+        text: entry.text,
+        url: url.href
+      });
+    }
+
+    if (!manifest.size) {
+      throw new Error("No usable recordings in manifest.");
+    }
+
+    manifestReady = true;
+    updateReplay();
   } catch (error) {
     console.error(error);
 
-    showNote(
-      "Could not load roads.csv. Check that it is in the " +
-      "same folder as index.html and has the expected columns."
+    status(
+      "Recordings could not load. Check audio/manifest.json " +
+      "and that the audio folder has been pushed to GitHub."
     );
-  } finally {
-    micBtn.disabled = !dataReady;
   }
+}
+
+function recording(key) {
+  return manifest.get(clipKey(key));
+}
+
+function updateReplay() {
+  replayBtn.disabled = !(
+    manifestReady &&
+    lastReply &&
+    lastReply.keys.length &&
+    lastReply.keys.every(key => recording(key))
+  );
+}
+
+// Store a reply for optional replay.
+// Only voice mode triggers automatic playback.
+function reply(keys, listenAfter = false) {
+  keys = Array.isArray(keys) ? keys : [keys];
+  keys = keys.filter(Boolean);
+
+  lastReply = keys.length ? { keys: [...keys] } : null;
+  updateReplay();
+
+  if (mode === "voice" && keys.length) {
+    requestPlayback(keys, listenAfter);
+  }
+}
+
+function clearReply() {
+  lastReply = null;
+  updateReplay();
+}
+
+// ============================================================
+// Audio-file playback — no speechSynthesis
+// ============================================================
+
+function stopPlayback(forget = false) {
+  playbackVersion++;
+
+  clearTimeout(playbackTimer);
+  clearTimeout(autoTimer);
+  playbackTimer = null;
+  autoTimer = null;
+
+  queuedReply = null;
+  playbackActive = false;
+
+  if (cancelClip) {
+    cancelClip();
+    cancelClip = null;
+  }
+
+  if (audio) {
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+  }
+
+  if (forget) clearReply();
+}
+
+function enterTextMode(forget = true) {
+  mode = "text";
+  stopPlayback(forget);
+  stopRecognition(true);
+  transcript.textContent = "";
+  status("");
+}
+
+function requestPlayback(keys, listenAfter) {
+  stopPlayback();
+
+  lastReply = { keys: [...keys] };
+  updateReplay();
+
+  if (!manifestReady) {
+    status("Recordings are not loaded. Check audio/manifest.json.");
+    return;
+  }
+
+  const missing = keys.find(key => !recording(key));
+
+  if (missing) {
+    status(`No recording available for ${missing}. See the screen.`);
+    return;
+  }
+
+  queuedReply = {
+    keys: [...keys],
+    listenAfter,
+    version: playbackVersion
+  };
+
+  if (micState !== "idle") {
+    status("Stopping microphone before playing reply...");
+    stopRecognition();
+    return;
+  }
+
+  flushPlayback();
+}
+
+function flushPlayback() {
+  clearTimeout(playbackTimer);
+  playbackTimer = null;
+
+  if (
+    !queuedReply ||
+    micState !== "idle" ||
+    document.hidden
+  ) {
+    return;
+  }
+
+  const job = queuedReply;
+
+  if (job.version !== playbackVersion) {
+    queuedReply = null;
+    return;
+  }
+
+  const wait = micReleasedAt + HANDOVER_MS - Date.now();
+
+  if (wait > 0) {
+    playbackTimer = setTimeout(flushPlayback, wait);
+    return;
+  }
+
+  queuedReply = null;
+  runPlayback(job);
+}
+
+async function runPlayback(job) {
+  playbackActive = true;
+
+  try {
+    for (const key of job.keys) {
+      if (
+        job.version !== playbackVersion ||
+        document.hidden ||
+        micState !== "idle"
+      ) {
+        return;
+      }
+
+      const entry = recording(key);
+      status(`Playing: ${entry.text}`);
+
+      const completed = await playClip(entry.url);
+
+      if (!completed || job.version !== playbackVersion) {
+        return;
+      }
+    }
+
+    if (job.version !== playbackVersion) return;
+
+    playbackActive = false;
+    status("");
+
+    if (
+      job.listenAfter &&
+      mode === "voice" &&
+      autoToggle.checked
+    ) {
+      autoTimer = setTimeout(() => {
+        autoTimer = null;
+
+        if (
+          job.version === playbackVersion &&
+          mode === "voice" &&
+          autoToggle.checked &&
+          !document.hidden
+        ) {
+          startListening(true);
+        }
+      }, 350);
+    }
+  } catch (error) {
+    if (job.version !== playbackVersion) return;
+
+    playbackActive = false;
+    console.error(error);
+
+    if (error.name === "NotAllowedError") {
+      status(
+        "Safari blocked automatic audio. " +
+        "Tap Read reply aloud to play the recording."
+      );
+    } else {
+      status(
+        "Could not play the recording. Check the MP3 is uploaded, " +
+        "then tap Read reply aloud. " +
+        (error.message || "")
+      );
+    }
+  } finally {
+    if (job.version === playbackVersion) {
+      playbackActive = false;
+    }
+  }
+}
+
+function playClip(url) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+
+    function finish(error, completed) {
+      if (settled) return;
+      settled = true;
+
+      clearTimeout(timer);
+      audio.onended = null;
+      audio.onerror = null;
+      cancelClip = null;
+
+      if (!completed) audio.pause();
+
+      if (error) {
+        reject(error);
+      } else {
+        resolve(completed);
+      }
+    }
+
+    cancelClip = () => finish(null, false);
+
+    audio.onended = () => finish(null, true);
+
+    audio.onerror = () => {
+      const code = audio.error ? audio.error.code : "unknown";
+      finish(new Error(`Audio error ${code}.`), false);
+    };
+
+    // A timeout is failure, not permission to restart listening.
+    timer = setTimeout(() => {
+      finish(new Error("Audio playback timed out."), false);
+    }, 60000);
+
+    audio.src = url;
+
+    try {
+      const promise = audio.play();
+
+      if (promise && typeof promise.catch === "function") {
+        promise.catch(error => finish(error, false));
+      }
+    } catch (error) {
+      finish(error, false);
+    }
+  });
+}
+
+// ============================================================
+// CSV parsing
+// ============================================================
+
+function splitCsvLine(line) {
+  const columns = [];
+  let value = "";
+  let quoted = false;
+
+  for (let index = 0; index < line.length; index++) {
+    const ch = line[index];
+
+    if (ch === '"') {
+      if (quoted && line[index + 1] === '"') {
+        value += '"';
+        index++;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (ch === "," && !quoted) {
+      columns.push(value);
+      value = "";
+    } else {
+      value += ch;
+    }
+  }
+
+  columns.push(value);
+  return columns;
 }
 
 function parseCsv(text) {
@@ -419,64 +638,35 @@ function parseCsv(text) {
     .slice(1);
 
   const entries = [];
-  let areaName = "ME10";
+  let entryArea = "ME10";
 
   for (const line of lines) {
     const columns = splitCsvLine(line);
     const road = (columns[0] || "").trim();
+    const walk = (columns[2] || "").trim();
 
     if (!road) {
-      // Your CSV separates ME10 and ME9 with blank rows.
-      if (entries.length && areaName === "ME10") {
-        areaName = "ME9";
+      if (entries.length && entryArea === "ME10") {
+        entryArea = "ME9";
       }
 
       continue;
     }
 
-    const walk = (columns[2] || "").trim();
     if (!walk) continue;
 
     const letter =
       (columns[1] || "").trim().toUpperCase() ||
-      firstLetter(road);
+      normalise(road.replace(/^THE\s+/i, ""))[0] ||
+      "";
 
-    entries.push(
-      makeEntry(road, walk, letter, areaName)
-    );
+    entries.push(makeEntry(road, walk, letter, entryArea));
   }
 
   return entries;
 }
 
-function splitCsvLine(line) {
-  const columns = [];
-  let value = "";
-  let quoted = false;
-
-  for (let index = 0; index < line.length; index++) {
-    const character = line[index];
-
-    if (character === '"') {
-      if (quoted && line[index + 1] === '"') {
-        value += '"';
-        index++;
-      } else {
-        quoted = !quoted;
-      }
-    } else if (character === "," && !quoted) {
-      columns.push(value);
-      value = "";
-    } else {
-      value += character;
-    }
-  }
-
-  columns.push(value);
-  return columns;
-}
-
-function makeEntry(road, walk, letter, areaName) {
+function makeEntry(road, walk, letter, entryArea) {
   const separator = road.indexOf(" - ");
   let base;
   let detail;
@@ -490,75 +680,57 @@ function makeEntry(road, walk, letter, areaName) {
     detail = match ? match[2] : "";
   }
 
-  const detailText = detail
+  const text = detail
     .replace(/(\d+)\s+-\s+(\d+)/g, "$1-$2")
     .toUpperCase();
 
   const outcodes = (
-    detailText.match(
-      /\b[A-Z]{1,2}\d{1,2}(?:\s+\d[A-Z]{0,2})?\b/g
-    ) || []
+    text.match(/\b[A-Z]{1,2}\d{1,2}(?:\s+\d[A-Z]{0,2})?\b/g) ||
+    []
   ).map(normalise);
 
   const inwards = (
-    detailText.match(/\b\d[A-Z]{2}\b/g) || []
+    text.match(/\b\d[A-Z]{2}\b/g) || []
   ).map(normalise);
 
   const ranges = [];
   const singles = [];
-  const hasPostcode = outcodes.length > 0;
-
-  const tokens = detailText
-    .replace(/[()&,]/g, " ")
-    .split(/\s+/);
+  const tokens = text.replace(/[()&,]/g, " ").split(/\s+/);
 
   for (let index = 0; index < tokens.length; index++) {
-    const token = tokens[index];
-    const match = token.match(/^(\d+)-(\d+)$/);
+    const match = tokens[index].match(/^(\d+)-(\d+)$/);
 
     if (match) {
       const first = Number(match[1]);
       const second = Number(match[2]);
       const next = tokens[index + 1];
 
-      let parity = null;
-
-      if (next === "ODD") parity = "odd";
-      if (next === "EVEN") parity = "even";
-
       ranges.push({
         lo: Math.min(first, second),
         hi: Math.max(first, second),
         first,
-        parity
+        parity: next === "ODD"
+          ? "odd"
+          : next === "EVEN" ? "even" : null
       });
-    } else if (/^\d+$/.test(token) && !hasPostcode) {
-      singles.push(Number(token));
+    } else if (/^\d+$/.test(tokens[index]) && !outcodes.length) {
+      singles.push(Number(tokens[index]));
     }
   }
 
-  if (ranges.length === 2 && singles.length === 0) {
-    for (const range of ranges) {
+  if (ranges.length === 2 && !singles.length) {
+    ranges.forEach(range => {
       if (!range.parity) {
         range.parity = range.first % 2 ? "odd" : "even";
       }
-    }
+    });
   }
-
-  const fallback =
-    /EXCEPT|REMAINDER/i.test(road) ||
-    (
-      ranges.length === 0 &&
-      singles.length === 0 &&
-      outcodes.length === 0 &&
-      inwards.length === 0
-    );
 
   return {
     road,
     walk,
     letter,
-    areaName,
+    area: entryArea,
     base,
     detail,
     baseN: normalise(base),
@@ -567,14 +739,15 @@ function makeEntry(road, walk, letter, areaName) {
     singles,
     outcodes,
     inwards,
-    fallback
+    fallback:
+      /EXCEPT|REMAINDER/i.test(road) ||
+      (
+        !ranges.length &&
+        !singles.length &&
+        !outcodes.length &&
+        !inwards.length
+      )
   };
-}
-
-function firstLetter(name) {
-  return normalise(
-    name.replace(/^THE\s+/i, "")
-  )[0] || "";
 }
 
 // ============================================================
@@ -582,51 +755,34 @@ function firstLetter(name) {
 // ============================================================
 
 function normalise(value) {
-  return String(value)
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "");
+  return String(value).toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
 function walkKey(value) {
   const text = normalise(value);
-  const match = text.match(/^([TUZ]?)(\d+)$/);
-
-  return match ? String(parseInt(match[2], 10)) : text;
-}
-
-function displayWalk(walk) {
-  return walkKey(walk);
+  const match = text.match(/^[TUZ]?(\d+)$/);
+  return match ? String(parseInt(match[1], 10)) : text;
 }
 
 function areaRoads() {
-  return roads.filter(
-    entry => entry.areaName === selectedArea
-  );
+  return roads.filter(entry => entry.area === area);
 }
 
 function findWalk(query) {
   const key = walkKey(query);
-  if (!key) return [];
-
-  return areaRoads().filter(
-    entry => walkKey(entry.walk) === key
-  );
+  return key
+    ? areaRoads().filter(entry => walkKey(entry.walk) === key)
+    : [];
 }
 
 function findRoads(query, list = areaRoads()) {
   const text = normalise(query);
   if (!text) return [];
 
-  const exact = list.filter(
-    entry => entry.baseN === text
-  );
-
+  const exact = list.filter(entry => entry.baseN === text);
   if (exact.length) return exact;
 
-  const starts = list.filter(
-    entry => entry.baseN.startsWith(text)
-  );
-
+  const starts = list.filter(entry => entry.baseN.startsWith(text));
   if (starts.length) return starts;
 
   return text.length >= 4
@@ -637,54 +793,21 @@ function findRoads(query, list = areaRoads()) {
 function needsDetail(matches) {
   return (
     matches.length > 1 &&
-    matches.every(
-      entry => entry.baseN === matches[0].baseN
-    ) &&
+    matches.every(entry => entry.baseN === matches[0].baseN) &&
     matches.some(entry => entry.detail)
   );
 }
 
-function looksLikeRoad(query) {
-  return (
-    normalise(query).length >= 3 &&
-    findRoads(query).length > 0
-  );
-}
-
-function isNumberOrPostcode(query) {
-  const text = normalise(query);
-
-  return (
-    /^\d+[A-Z]?$/.test(text) ||
-    /^[A-Z]{1,2}\d/.test(text) ||
-    /^\d[A-Z]{2}$/.test(text)
-  );
-}
-
 function housesMatch(entry, number) {
-  if (entry.singles.includes(number)) return true;
-
-  return entry.ranges.some(range => {
-    if (number < range.lo || number > range.hi) {
-      return false;
-    }
-
-    if (!range.parity) return true;
-
-    return (
-      (range.parity === "odd") ===
-      (number % 2 === 1)
-    );
-  });
-}
-
-function postcodeMatch(entry, text) {
   return (
-    entry.outcodes.some(
-      code => code.startsWith(text) || text.startsWith(code)
-    ) ||
-    entry.inwards.some(
-      inward => text === inward || text.endsWith(inward)
+    entry.singles.includes(number) ||
+    entry.ranges.some(range =>
+      number >= range.lo &&
+      number <= range.hi &&
+      (
+        !range.parity ||
+        (range.parity === "odd") === (number % 2 === 1)
+      )
     )
   );
 }
@@ -692,26 +815,29 @@ function postcodeMatch(entry, text) {
 function answerPending(query) {
   if (!pending) return null;
 
-  const list = pending.matches;
   const text = normalise(query);
-
   if (!text) return null;
 
   let hits;
 
   if (/^\d+[A-Z]?$/.test(text)) {
-    hits = list.filter(entry =>
+    hits = pending.matches.filter(entry =>
       housesMatch(entry, parseInt(text, 10))
     );
   } else if (
     /^[A-Z]{1,2}\d/.test(text) ||
     /^\d[A-Z]{2}$/.test(text)
   ) {
-    hits = list.filter(entry =>
-      postcodeMatch(entry, text)
+    hits = pending.matches.filter(entry =>
+      entry.outcodes.some(code =>
+        code.startsWith(text) || text.startsWith(code)
+      ) ||
+      entry.inwards.some(code =>
+        text === code || text.endsWith(code)
+      )
     );
   } else if (text.length >= 3) {
-    hits = list.filter(entry =>
+    hits = pending.matches.filter(entry =>
       entry.detailN.includes(text)
     );
 
@@ -721,15 +847,11 @@ function answerPending(query) {
   }
 
   if (!hits.length) {
-    hits = list.filter(entry => entry.fallback);
+    hits = pending.matches.filter(entry => entry.fallback);
   }
 
   return hits.length ? hits : null;
 }
-
-// ============================================================
-// Forgiving road-name matching
-// ============================================================
 
 function coreName(value) {
   const words = String(value)
@@ -741,276 +863,152 @@ function coreName(value) {
   return words.length ? words.join("") : normalise(value);
 }
 
-function editDistance(first, second) {
+function editDistance(a, b) {
   let previous = Array.from(
-    { length: second.length + 1 },
+    { length: b.length + 1 },
     (_, index) => index
   );
 
-  for (let row = 1; row <= first.length; row++) {
+  for (let row = 1; row <= a.length; row++) {
     const current = [row];
 
-    for (let column = 1; column <= second.length; column++) {
-      const cost =
-        first[row - 1] === second[column - 1] ? 0 : 1;
-
+    for (let column = 1; column <= b.length; column++) {
       current[column] = Math.min(
         previous[column] + 1,
         current[column - 1] + 1,
-        previous[column - 1] + cost
+        previous[column - 1] +
+          (a[row - 1] === b[column - 1] ? 0 : 1)
       );
     }
 
     previous = current;
   }
 
-  return previous[second.length];
+  return previous[b.length];
 }
 
-function similarity(first, second) {
-  const longest = Math.max(first.length, second.length);
-
-  return longest
-    ? 1 - editDistance(first, second) / longest
-    : 0;
-}
-
-function scoreName(spoken, candidate) {
-  if (!spoken || !candidate) return 0;
-  if (spoken === candidate) return 1;
-
-  let score = similarity(spoken, candidate);
-
-  if (
-    Math.min(spoken.length, candidate.length) >= 4 &&
-    (
-      candidate.startsWith(spoken) ||
-      spoken.startsWith(candidate)
-    )
-  ) {
-    score = Math.max(score, 0.8);
-  }
-
-  return score;
-}
-
-function suggestRoads(spokenList, limit = 3) {
+function suggestRoads(alternatives) {
   const bases = new Map();
 
-  for (const entry of areaRoads()) {
+  areaRoads().forEach(entry => {
     if (!bases.has(entry.baseN)) {
       bases.set(entry.baseN, {
         base: entry.base,
         baseN: entry.baseN,
-        core: coreName(entry.base)
+        core: coreName(entry.base),
+        score: 0
       });
     }
-  }
+  });
 
-  const best = new Map();
-
-  for (const spoken of spokenList) {
-    const said = coreName(spoken);
+  for (const raw of alternatives) {
+    const said = coreName(raw);
     if (said.length < 3) continue;
 
     for (const candidate of bases.values()) {
-      const score = scoreName(said, candidate.core);
-      if (score < MIN_SUGGEST) continue;
+      const longest = Math.max(said.length, candidate.core.length);
 
-      const previous = best.get(candidate.baseN);
+      let score = longest
+        ? 1 - editDistance(said, candidate.core) / longest
+        : 0;
 
-      if (!previous || score > previous.score) {
-        best.set(candidate.baseN, {
-          ...candidate,
-          score
-        });
+      if (
+        Math.min(said.length, candidate.core.length) >= 4 &&
+        (
+          said.startsWith(candidate.core) ||
+          candidate.core.startsWith(said)
+        )
+      ) {
+        score = Math.max(score, 0.8);
       }
+
+      candidate.score = Math.max(candidate.score, score);
     }
   }
 
-  return [...best.values()]
-    .sort((first, second) => second.score - first.score)
-    .slice(0, limit);
+  return [...bases.values()]
+    .filter(candidate => candidate.score >= MIN_SUGGEST)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
 }
 
 // ============================================================
-// Spoken-text normalisation
+// Display and navigation
 // ============================================================
 
-function cleanSpoken(value) {
-  return String(value)
-    .toLowerCase()
-    .replace(/['\u2019]/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
-
-function wordsToDigits(text) {
-  const words = text.toLowerCase().trim().split(/\s+/);
-  const output = [];
-
-  for (let index = 0; index < words.length; index++) {
-    const value = NUMBER_WORDS[words[index]];
-
-    if (value === undefined) {
-      output.push(words[index]);
-      continue;
-    }
-
-    const next = NUMBER_WORDS[words[index + 1]];
-
-    if (
-      value >= 20 &&
-      next !== undefined &&
-      next > 0 &&
-      next < 10
-    ) {
-      output.push(String(value + next));
-      index++;
-    } else {
-      output.push(String(value));
-    }
-  }
-
-  return output.join(" ");
-}
-
-function heardAsNumber(raw) {
-  const text = cleanSpoken(raw).replace(
-    /^(number|option|house number|house|the) /,
-    ""
-  );
-
-  if (
-    Object.prototype.hasOwnProperty.call(
-      NUMBER_ALIASES,
-      text
-    )
-  ) {
-    return NUMBER_ALIASES[text];
-  }
-
-  return wordsToDigits(text);
-}
-
-function fixCodes(text) {
-  return text
-    .replace(/\b(you|u)\s*(\d)/gi, "U$2")
-    .replace(/\b(tea|tee|t)\s*(\d)/gi, "T$2")
-    .replace(/\b(zed|zee|said|z)\s*(\d)/gi, "Z$2");
-}
-
-function choiceIndex(raw, count) {
-  const number = Number(heardAsNumber(raw));
-
-  return (
-    Number.isInteger(number) &&
-    number >= 1 &&
-    number <= count
-  ) ? number - 1 : -1;
-}
-
-// ============================================================
-// Area selection
-// ============================================================
-
-function areaFromText(text) {
-  const value = normalise(text);
-
-  return value === "ME10" || value === "ME9"
-    ? value
-    : null;
-}
-
-function applyArea(name) {
-  selectedArea = name;
-
-  me10Tab.classList.toggle("active", name === "ME10");
-  me9Tab.classList.toggle("active", name === "ME9");
-  areaLabel.textContent = name;
+function applyArea() {
+  me10Tab.classList.toggle("active", area === "ME10");
+  me9Tab.classList.toggle("active", area === "ME9");
+  areaLabel.textContent = area;
 }
 
 function setArea(name) {
-  if (!dataReady) return;
+  if (!ready) return;
 
-  clearTimeout(typingTimer);
-  cancelSpeech(true);
-
-  applyArea(name);
-  writePreference(AREA_KEY, name);
-
+  stopPlayback(true);
+  area = name;
   pending = null;
   suggestions = null;
 
+  saveSetting(AREA_KEY, name);
+  applyArea();
   buildGrids();
 
   const query = input.value.trim();
 
   if (query && !areaFromText(query)) {
-    handleInput(query, "final");
-    return;
+    lookup(query);
+  } else {
+    input.value = "";
+    clearResults();
+    note(`Showing ${area}. Type or say a road name.`);
+
+    // There is no recorded area-announcement clip.
+    if (mode === "voice") {
+      reply("prompt:retry", true);
+    }
   }
-
-  input.value = "";
-  clearResults();
-
-  showNote(`Showing ${name}. Type or say a road name.`);
-  respond(`Showing ${AREA_SPOKEN[name]}.`, listenAuto);
 }
 
-// ============================================================
-// Tabs and grids
-// ============================================================
+function addButton(parent, label, callback) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.onclick = callback;
+  parent.appendChild(button);
+}
 
 function buildGrids() {
   letterGrid.innerHTML = "";
   walkGrid.innerHTML = "";
 
   const letters = [
-    ...new Set(
-      areaRoads()
-        .map(entry => entry.letter)
-        .filter(letter => /^[A-Z]$/.test(letter))
-    )
-  ].sort();
+    ...new Set(areaRoads().map(entry => entry.letter))
+  ].filter(letter => /^[A-Z]$/.test(letter)).sort();
 
   letters.forEach(letter => {
     addButton(letterGrid, letter, () => {
-      beginTextInteraction();
-      showLetter(letter);
+      enterTextMode();
+      showDuties(areaRoads().filter(entry => entry.letter === letter));
     });
   });
 
   const walks = [
-    ...new Set(
-      areaRoads().map(entry => walkKey(entry.walk))
-    )
-  ].sort((first, second) =>
-    first.localeCompare(second, undefined, {
-      numeric: true
-    })
-  );
+    ...new Set(areaRoads().map(entry => walkKey(entry.walk)))
+  ].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 
   walks.forEach(walk => {
     addButton(walkGrid, walk, () => {
-      beginTextInteraction();
-      showByWalk(walk);
+      enterTextMode();
+      showDuties(findWalk(walk));
     });
   });
 }
 
-function addButton(parent, label, onClick) {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.textContent = label;
-  button.onclick = onClick;
-  parent.appendChild(button);
-}
-
-function switchMode(mode) {
-  const isRoad = mode === "road";
+function switchMode(name) {
   pending = null;
 
+  const isRoad = name === "road";
   roadTab.classList.toggle("active", isRoad);
   walkTab.classList.toggle("active", !isRoad);
   letterGrid.classList.toggle("hidden", !isRoad);
@@ -1019,131 +1017,102 @@ function switchMode(mode) {
   clearResults();
 }
 
-function compactGrids() {
+function clearResults() {
+  suggestions = null;
+  results.innerHTML = "";
+  letterGrid.classList.remove("compact");
+  walkGrid.classList.remove("compact");
+  clearReply();
+}
+
+function compact() {
   letterGrid.classList.add("compact");
   walkGrid.classList.add("compact");
 }
 
-function clearResults() {
-  suggestions = null;
-  results.innerHTML = "";
-
-  letterGrid.classList.remove("compact");
-  walkGrid.classList.remove("compact");
-
-  rememberReply("");
+function note(text) {
+  const row = document.createElement("li");
+  row.className = "note";
+  row.textContent = text;
+  results.replaceChildren(row);
+  clearReply();
 }
 
-function reset() {
-  beginTextInteraction();
-
-  pending = null;
-  suggestions = null;
-  input.value = "";
-
-  clearResults();
-}
-
-// ============================================================
-// Results and prompts
-// ============================================================
-
-function showLetter(letter) {
-  pending = null;
-
-  showDuties(
-    areaRoads().filter(entry => entry.letter === letter)
-  );
-}
-
-function showByWalk(key) {
-  pending = null;
-
-  showDuties(
-    areaRoads().filter(
-      entry => walkKey(entry.walk) === key
-    )
-  );
-}
-
-function showDuties(matches) {
-  pending = null;
-  suggestions = null;
-
-  compactGrids();
-  results.innerHTML = "";
-
-  if (!matches.length) {
-    showNote("No road found");
-  } else {
-    [...matches]
-      .sort((first, second) =>
-        first.road.localeCompare(second.road)
-      )
-      .forEach(entry => {
-        results.appendChild(resultRow(entry));
-      });
-  }
-
-  respond(dutyMessage(matches));
-}
-
-function dutyMessage(matches) {
-  if (!matches.length) {
-    return "No road found.";
-  }
-
-  if (matches.length > 5) {
-    return `${matches.length} entries. See the screen.`;
-  }
-
-  return matches.map(
-    entry =>
-      `${entry.base}, duty ${displayWalk(entry.walk)}`
-  ).join(". ");
+function appendNote(text) {
+  const row = document.createElement("li");
+  row.className = "note";
+  row.textContent = text;
+  results.appendChild(row);
 }
 
 function resultRow(entry) {
   const row = document.createElement("li");
-
   const name = document.createElement("span");
+
   name.className = "road";
   name.textContent = entry.base;
 
   if (entry.detail) {
     const detail = document.createElement("small");
     detail.textContent = entry.detail;
-
-    name.append(
-      document.createElement("br"),
-      detail
-    );
+    name.append(document.createElement("br"), detail);
   }
 
-  const walk = document.createElement("span");
-  walk.className = "walk";
-  walk.textContent = displayWalk(entry.walk);
+  const duty = document.createElement("span");
+  duty.className = "walk";
+  duty.textContent = walkKey(entry.walk);
 
-  row.append(name, walk);
+  row.append(name, duty);
   return row;
 }
 
-function makeNote(text) {
-  const row = document.createElement("li");
-  row.className = "note";
-  row.textContent = text;
-  return row;
-}
-
-function showNote(text) {
+function showDuties(matches) {
+  pending = null;
   suggestions = null;
+  compact();
   results.innerHTML = "";
-  results.appendChild(makeNote(text));
 
-  rememberReply(text);
+  if (!matches.length) {
+    appendNote("No road found.");
+    reply("prompt:no-match");
+    return;
+  }
+
+  [...matches]
+    .sort((a, b) => a.road.localeCompare(b.road))
+    .forEach(entry => results.appendChild(resultRow(entry)));
+
+  const duties = [
+    ...new Set(matches.map(entry => walkKey(entry.walk)))
+  ];
+
+  // Recordings contain duty announcements, not standalone
+  // road names. Keep the road/detail information on screen.
+  if (duties.length <= 5) {
+    reply(duties.map(duty => `duty:${duty}`));
+  } else {
+    clearReply();
+
+    if (mode === "voice") {
+      status("Multiple results. See the screen for their duties.");
+    }
+  }
 }
 
-function optionRow(label, onClick, dashed = false) {
+function askDetail(matches, message) {
+  if (mode !== "voice") {
+    showDuties(matches);
+    return;
+  }
+
+  suggestions = null;
+  pending = { matches };
+  compact();
+  note(message);
+  reply("prompt:detail", true);
+}
+
+function option(label, callback, dashed = false) {
   const row = document.createElement("li");
   const button = document.createElement("button");
 
@@ -1152,8 +1121,8 @@ function optionRow(label, onClick, dashed = false) {
 
   Object.assign(button.style, {
     width: "100%",
-    textAlign: "left",
     padding: "12px",
+    textAlign: "left",
     fontSize: "17px",
     background: "#fff",
     color: dashed ? "#555" : "#1d1d1f",
@@ -1161,38 +1130,31 @@ function optionRow(label, onClick, dashed = false) {
     borderRadius: "8px"
   });
 
-  if (dashed) {
-    button.style.borderStyle = "dashed";
-  }
+  if (dashed) button.style.borderStyle = "dashed";
 
   button.onclick = () => {
-    beginTextInteraction();
-    onClick();
+    enterTextMode();
+    callback();
   };
 
   row.appendChild(button);
-  return row;
+  results.appendChild(row);
 }
 
-function askDetail(matches, message) {
-  // Typed searches display every matching entry directly.
-  if (interactionMode !== "voice") {
-    showDuties(matches);
-    return;
-  }
-
-  pending = { matches };
-  compactGrids();
-  showNote(message);
-
-  respond(message, listenAuto);
+function reset() {
+  enterTextMode();
+  pending = null;
+  suggestions = null;
+  input.value = "";
+  clearResults();
 }
 
 // ============================================================
-// "Did you mean" choices and confirmation
+// Suggestions
 // ============================================================
 
 function offerOptions(options) {
+  pending = null;
   suggestions = {
     options,
     stage: "choose",
@@ -1206,99 +1168,35 @@ function renderChoose() {
   if (!suggestions) return;
 
   const options = suggestions.options;
-
-  compactGrids();
+  compact();
   results.innerHTML = "";
 
-  results.appendChild(
-    makeNote(
-      options.length === 1
-        ? "Did you mean this?"
-        : "Did you mean one of these?"
-    )
+  appendNote(
+    options.length === 1
+      ? "Did you mean this?"
+      : "Did you mean one of these?"
   );
 
-  options.forEach((option, index) => {
-    const label = options.length > 1
-      ? `${index + 1}. ${option.base}`
-      : option.base;
+  options.forEach((candidate, index) => {
+    const label = options.length === 1
+      ? candidate.base
+      : `${index + 1}. ${candidate.base}`;
 
-    results.appendChild(
-      optionRow(label, () => pickOption(index))
-    );
+    option(label, () => pickOption(index));
   });
 
-  results.appendChild(
-    optionRow("None of these", cancelSuggestions, true)
-  );
+  option("None of these", cancelSuggestions, true);
 
-  respond(choosePrompt(options), listenAuto);
-}
-
-function renderConfirm() {
-  if (!suggestions) return;
-
-  const index = suggestions.chosen;
-  const option = suggestions.options[index];
-
-  if (!option) return;
-
-  compactGrids();
-  results.innerHTML = "";
-
-  results.appendChild(
-    makeNote(
-      `${ORDINAL[index]}: ${option.base}. Is that right?`
-    )
-  );
-
-  results.appendChild(
-    optionRow("Yes, that one", () => acceptOption(index))
-  );
-
-  results.appendChild(
-    optionRow("No, choose again", backToChoose, true)
-  );
-
-  respond(confirmPrompt(index), listenAuto);
-}
-
-function choosePrompt(options) {
   if (options.length === 1) {
-    return (
-      `Did you mean ${options[0].base}? ` +
-      "Say yes or no."
-    );
+    reply(`confirm:${options[0].base}`, true);
+  } else {
+    // No numbered road-name recordings exist in the manifest.
+    reply("prompt:choose", true);
   }
-
-  const choices = options.map(
-    (option, index) => `${index + 1}, ${option.base}`
-  ).join(". ");
-
-  return `Did you mean: ${choices}? Say the number.`;
-}
-
-function confirmPrompt(index) {
-  const option = suggestions.options[index];
-
-  const entries = areaRoads().filter(
-    entry => entry.baseN === option.baseN
-  );
-
-  const duty = entries.length === 1
-    ? `, duty ${displayWalk(entries[0].walk)}`
-    : "";
-
-  return (
-    `${ORDINAL[index]}: ${option.base}${duty}. ` +
-    "Is that right? Say yes or no."
-  );
 }
 
 function pickOption(index) {
-  if (!suggestions || !suggestions.options[index]) {
-    return;
-  }
+  if (!suggestions || !suggestions.options[index]) return;
 
   if (suggestions.options.length === 1) {
     acceptOption(0);
@@ -1307,42 +1205,50 @@ function pickOption(index) {
 
   suggestions.stage = "confirm";
   suggestions.chosen = index;
-
   renderConfirm();
 }
 
-function backToChoose() {
+function renderConfirm() {
   if (!suggestions) return;
 
-  suggestions.stage = "choose";
-  suggestions.chosen = -1;
+  const index = suggestions.chosen;
+  const candidate = suggestions.options[index];
+  if (!candidate) return;
 
-  renderChoose();
+  compact();
+  results.innerHTML = "";
+
+  appendNote(`Did you mean ${candidate.base}?`);
+  option("Yes, that one", () => acceptOption(index));
+
+  option("No, choose again", () => {
+    if (!suggestions) return;
+    suggestions.stage = "choose";
+    suggestions.chosen = -1;
+    renderChoose();
+  }, true);
+
+  reply(`confirm:${candidate.base}`, true);
 }
 
 function acceptOption(index) {
-  if (!suggestions || !suggestions.options[index]) {
-    return;
-  }
+  if (!suggestions || !suggestions.options[index]) return;
 
-  const option = suggestions.options[index];
-
+  const candidate = suggestions.options[index];
   suggestions = null;
-  input.value = option.base;
-
-  lookup(option.base);
+  input.value = candidate.base;
+  lookup(candidate.base);
 }
 
 function cancelSuggestions() {
   suggestions = null;
   pending = null;
   input.value = "";
-
-  showNote("Okay. Say or type the road name again.");
-  respond("Okay. Say the road again.", listenAuto);
+  note("Okay. Type or say the road again.");
+  reply("prompt:retry", true);
 }
 
-function handleSuggestionAnswer(alternatives) {
+function handleSuggestion(alternatives) {
   if (!suggestions) return false;
 
   const { options, stage, chosen } = suggestions;
@@ -1350,52 +1256,48 @@ function handleSuggestionAnswer(alternatives) {
   for (const raw of alternatives) {
     const said = cleanSpoken(raw);
 
-    if (CANCEL_WORDS.has(said)) {
+    if (CANCEL.has(said)) {
       cancelSuggestions();
       return true;
     }
 
-    if (stage === "confirm") {
-      if (YES_WORDS.has(said)) {
+    if (YES.has(said)) {
+      if (stage === "confirm") {
         acceptOption(chosen);
-        return true;
+      } else if (options.length === 1) {
+        acceptOption(0);
+      } else {
+        reply("prompt:choose", true);
       }
 
-      if (NO_WORDS.has(said)) {
-        backToChoose();
-        return true;
-      }
-    } else {
-      if (YES_WORDS.has(said)) {
-        if (options.length === 1) {
-          acceptOption(0);
-        } else {
-          respond(
-            "Say the number of the road you want.",
-            listenAuto
-          );
-        }
-
-        return true;
-      }
-
-      if (NO_WORDS.has(said)) {
-        cancelSuggestions();
-        return true;
-      }
-    }
-
-    const index = choiceIndex(raw, options.length);
-
-    if (index !== -1) {
-      pickOption(index);
       return true;
     }
 
-    const core = coreName(raw);
+    if (NO.has(said)) {
+      if (stage === "confirm") {
+        suggestions.stage = "choose";
+        suggestions.chosen = -1;
+        renderChoose();
+      } else {
+        cancelSuggestions();
+      }
+
+      return true;
+    }
+
+    const number = Number(heardAsNumber(raw));
+
+    if (
+      Number.isInteger(number) &&
+      number >= 1 &&
+      number <= options.length
+    ) {
+      pickOption(number - 1);
+      return true;
+    }
 
     const named = options.filter(
-      option => option.core === core
+      candidate => candidate.core === coreName(raw)
     );
 
     if (named.length === 1) {
@@ -1408,13 +1310,18 @@ function handleSuggestionAnswer(alternatives) {
 }
 
 // ============================================================
-// Typed input and lookup
+// Typed lookup
 // ============================================================
 
-function handleInput(text, mode) {
-  if (!dataReady) return;
+function areaFromText(text) {
+  const value = normalise(text);
+  return value === "ME10" || value === "ME9" ? value : null;
+}
 
-  const query = text.trim();
+function handleInput(raw, final) {
+  if (!ready) return;
+
+  const query = raw.trim();
 
   if (!query) {
     pending = null;
@@ -1423,71 +1330,44 @@ function handleInput(text, mode) {
   }
 
   if (suggestions) {
-    if (mode !== "final") {
-      rememberReply(
-        suggestions.stage === "confirm"
-          ? confirmPrompt(suggestions.chosen)
-          : choosePrompt(suggestions.options)
-      );
-
-      return;
-    }
-
-    if (handleSuggestionAnswer([query])) return;
+    if (!final) return;
+    if (handleSuggestion([query])) return;
     suggestions = null;
   }
 
-  // A pending detail question can originate from a voice search.
-  // If the user types an answer, process it silently.
   if (pending) {
+    const matches = pending.matches;
     const hits = answerPending(query);
 
     if (hits) {
-      const openQuestion = pending;
-
       showDuties(hits);
-
-      if (mode === "live") {
-        pending = openQuestion;
-      }
-
       return;
     }
 
-    const area = areaFromText(query);
+    const requestedArea = areaFromText(query);
 
-    if (area && mode === "final") {
-      input.value = area;
-      setArea(area);
+    if (requestedArea && final) {
+      input.value = requestedArea;
+      setArea(requestedArea);
       return;
     }
 
     if (
-      isNumberOrPostcode(query) ||
-      (query.length >= 3 && !looksLikeRoad(query))
+      /^\d/.test(normalise(query)) ||
+      /^[A-Z]{1,2}\d/.test(normalise(query))
     ) {
-      if (interactionMode === "text") {
-        // Show the available entries instead of a clarification.
-        showDuties(pending.matches);
-      } else if (mode === "final" || mode === "pause") {
-        askDetail(
-          pending.matches,
-          `No match for ${query}. ` +
-          "Try another house number or postcode."
-        );
-      }
-
+      showDuties(matches);
       return;
     }
 
     pending = null;
   }
 
-  const area = areaFromText(query);
+  const requestedArea = areaFromText(query);
 
-  if (area) {
-    if (mode === "final") {
-      setArea(area);
+  if (requestedArea) {
+    if (final) {
+      setArea(requestedArea);
     } else {
       clearResults();
     }
@@ -1495,11 +1375,7 @@ function handleInput(text, mode) {
     return;
   }
 
-  if (
-    mode === "live" &&
-    query.length < 3 &&
-    !findWalk(query).length
-  ) {
+  if (!final && query.length < 3 && !findWalk(query).length) {
     clearResults();
     return;
   }
@@ -1508,124 +1384,150 @@ function handleInput(text, mode) {
 }
 
 function lookup(query) {
-  const walkHits = findWalk(query);
+  const duties = findWalk(query);
 
-  if (walkHits.length) {
-    showDuties(walkHits);
+  if (duties.length) {
+    showDuties(duties);
     return;
   }
 
   const matches = findRoads(query);
 
-  if (!matches.length) {
-    const elsewhere = findRoads(
-      query,
-      roads.filter(
-        entry => entry.areaName !== selectedArea
-      )
-    );
-
-    if (elsewhere.length) {
-      const otherArea = elsewhere[0].areaName;
-
-      showNote(
-        `Not in ${selectedArea}. Found in ${otherArea}. ` +
-        `Say or type ${otherArea} to switch.`
+  if (matches.length) {
+    if (mode === "voice" && needsDetail(matches)) {
+      askDetail(
+        matches,
+        `${matches[0].base} has ${matches.length} entries. ` +
+        "Which house number or postcode?"
       );
-
-      respond(
-        `Not in ${AREA_SPOKEN[selectedArea]}. ` +
-        `Found in ${AREA_SPOKEN[otherArea]}. ` +
-        `Say ${AREA_SPOKEN[otherArea]} to switch.`,
-        listenAuto
-      );
-
-      return;
-    }
-
-    const options = suggestRoads([query]);
-
-    if (options.length) {
-      offerOptions(options);
     } else {
-      showDuties([]);
+      // Typed searches always show every matching entry.
+      showDuties(matches);
     }
 
     return;
   }
 
-  // Only microphone searches ask for additional details.
-  // Typed searches display every matching CSV entry.
-  if (
-    interactionMode === "voice" &&
-    needsDetail(matches)
-  ) {
-    askDetail(
-      matches,
-      `${matches[0].base} has ${matches.length} entries. ` +
-      "Which house number or postcode?"
+  const elsewhere = findRoads(
+    query,
+    roads.filter(entry => entry.area !== area)
+  );
+
+  if (elsewhere.length) {
+    pending = null;
+    suggestions = null;
+
+    note(
+      `Not in ${area}. Found in ${elsewhere[0].area}. ` +
+      "Select that area to search there."
     );
 
+    // There is no matching recorded area-switch sentence.
     return;
   }
 
-  showDuties(matches);
+  const options = suggestRoads([query]);
+
+  if (options.length) {
+    offerOptions(options);
+  } else {
+    showDuties([]);
+  }
 }
 
 // ============================================================
-// Spoken input interpretation
+// Voice interpretation
 // ============================================================
 
-function handleVoice(alternatives) {
-  if (
-    !dataReady ||
-    !alternatives.length ||
-    interactionMode !== "voice"
-  ) {
-    return;
-  }
+function cleanSpoken(value) {
+  return String(value)
+    .toLowerCase()
+    .replace(/['\u2019]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
 
-  if (
-    suggestions &&
-    handleSuggestionAnswer(alternatives)
-  ) {
-    return;
-  }
-
-  suggestions = null;
-
-  const spoken = alternatives.map(
-    value => fixCodes(heardAsNumber(value))
+function heardAsNumber(raw) {
+  const text = cleanSpoken(raw).replace(
+    /^(number|option|house number|house|the) /,
+    ""
   );
 
-  for (const value of spoken) {
-    const area = areaFromText(value);
+  if (Object.prototype.hasOwnProperty.call(NUMBER_ALIASES, text)) {
+    return NUMBER_ALIASES[text];
+  }
 
-    if (area) {
-      input.value = area;
-      setArea(area);
+  const words = text.split(/\s+/);
+  const output = [];
+
+  for (let index = 0; index < words.length; index++) {
+    const value = NUMBER_WORDS[words[index]];
+    const next = NUMBER_WORDS[words[index + 1]];
+
+    if (value === undefined) {
+      output.push(words[index]);
+    } else if (
+      value >= 20 &&
+      next !== undefined &&
+      next > 0 &&
+      next < 10
+    ) {
+      output.push(String(value + next));
+      index++;
+    } else {
+      output.push(String(value));
+    }
+  }
+
+  return output.join(" ")
+    .replace(/\b(you|u)\s*(\d)/gi, "U$2")
+    .replace(/\b(tea|tee|t)\s*(\d)/gi, "T$2")
+    .replace(/\b(zed|zee|said|z)\s*(\d)/gi, "Z$2");
+}
+
+function handleVoice(alternatives) {
+  if (mode !== "voice" || !ready) return;
+
+  if (suggestions && handleSuggestion(alternatives)) return;
+  suggestions = null;
+
+  const spoken = alternatives.map(heardAsNumber);
+
+  for (const text of spoken) {
+    const requestedArea = areaFromText(text);
+
+    if (requestedArea) {
+      input.value = requestedArea;
+      setArea(requestedArea);
       return;
     }
   }
 
   if (pending) {
-    for (const value of spoken) {
-      const hits = answerPending(value);
+    for (const text of spoken) {
+      const hits = answerPending(text);
 
       if (hits) {
-        input.value = value;
+        input.value = text;
         showDuties(hits);
         return;
       }
     }
-  }
 
-  for (const value of spoken) {
-    const command = value.match(/^(walk|letter)\s+(.+)$/i);
+    // Keep the question open unless a different road was said.
+    const differentRoad = spoken.find(text => findRoads(text).length);
 
-    if (!command) continue;
+    if (!differentRoad) {
+      reply("prompt:detail", true);
+      return;
+    }
 
     pending = null;
+  }
+
+  for (const text of spoken) {
+    const command = text.match(/^(walk|letter)\s+(.+)$/i);
+    if (!command) continue;
 
     if (command[1].toLowerCase() === "walk") {
       switchMode("walk");
@@ -1633,280 +1535,50 @@ function handleVoice(alternatives) {
       showDuties(findWalk(command[2]));
     } else {
       switchMode("road");
-      showLetter(normalise(command[2])[0]);
+      const letter = normalise(command[2])[0];
+
+      showDuties(
+        areaRoads().filter(entry => entry.letter === letter)
+      );
     }
 
     return;
   }
 
-  const direct = spoken.find(
-    value => findRoads(value).length || findWalk(value).length
+  const direct = spoken.find(text =>
+    findRoads(text).length || findWalk(text).length
   );
 
   if (direct) {
     input.value = direct;
-    handleInput(direct, "final");
+    lookup(direct);
     return;
   }
 
-  const numeric = spoken.find(isNumberOrPostcode);
-
-  if (pending && numeric) {
-    input.value = numeric;
-    handleInput(numeric, "final");
-    return;
-  }
-
-  pending = null;
-  input.value = spoken[0];
-
+  input.value = spoken[0] || "";
   const options = suggestRoads(alternatives);
 
   if (options.length) {
     offerOptions(options);
-    return;
-  }
-
-  showNote("No road found. Tap Speak to try again.");
-  respond("No road found. Say the road again.", listenAuto);
-}
-
-// ============================================================
-// Speech output
-// ============================================================
-
-function clearSpeechTimers() {
-  clearTimeout(speechStartTimer);
-  clearTimeout(speechWatchdog);
-  clearTimeout(followUpTimer);
-
-  speechStartTimer = null;
-  speechWatchdog = null;
-  followUpTimer = null;
-}
-
-function cancelSpeech(forgetReply = false) {
-  speechVersion++;
-  clearSpeechTimers();
-
-  queuedReply = null;
-  currentUtterance = null;
-
-  if (synth && (synth.speaking || synth.pending)) {
-    synth.cancel();
-  }
-
-  if (forgetReply) {
-    rememberReply("");
-  }
-}
-
-function speak(text, onDone) {
-  text = String(text || "").trim();
-  if (!text) return;
-
-  const wasSpeaking = Boolean(
-    currentUtterance ||
-    (synth && (synth.speaking || synth.pending))
-  );
-
-  cancelSpeech();
-  rememberReply(text);
-
-  if (!synth) {
-    setAudioStatus(
-      "Spoken replies are not supported in this browser."
-    );
-
-    return;
-  }
-
-  queuedReply = {
-    text,
-    onDone,
-    version: speechVersion,
-    notBefore: wasSpeaking ? Date.now() + 150 : 0
-  };
-
-  if (micState !== "idle") {
-    setAudioStatus("Stopping microphone before reading reply...");
-    requestRecognitionStop();
-    return;
-  }
-
-  flushSpeech();
-}
-
-function flushSpeech() {
-  clearTimeout(speechStartTimer);
-  speechStartTimer = null;
-
-  if (
-    !queuedReply ||
-    micState !== "idle" ||
-    document.hidden
-  ) {
-    return;
-  }
-
-  const reply = queuedReply;
-
-  if (reply.version !== speechVersion) {
-    queuedReply = null;
-    return;
-  }
-
-  const earliestStart = Math.max(
-    micReleasedAt + AUDIO_HANDOVER_MS,
-    reply.notBefore
-  );
-
-  const remaining = earliestStart - Date.now();
-
-  if (remaining > 0) {
-    speechStartTimer = setTimeout(flushSpeech, remaining);
-    return;
-  }
-
-  queuedReply = null;
-  playSpeech(reply);
-}
-
-function playSpeech(reply) {
-  if (
-    !synth ||
-    reply.version !== speechVersion ||
-    micState !== "idle" ||
-    document.hidden
-  ) {
-    return;
-  }
-
-  const utterance = new SpeechSynthesisUtterance(reply.text);
-  utterance.lang = "en-GB";
-  utterance.rate = SPEECH_RATE;
-
-  const britishVoice = synth.getVoices().find(
-    voice => voice.lang.toLowerCase() === "en-gb"
-  );
-
-  if (britishVoice) {
-    utterance.voice = britishVoice;
-  }
-
-  currentUtterance = utterance;
-
-  function isCurrent() {
-    return (
-      reply.version === speechVersion &&
-      currentUtterance === utterance
-    );
-  }
-
-  function fail(message) {
-    if (!isCurrent()) return;
-
-    clearTimeout(speechWatchdog);
-    speechWatchdog = null;
-    currentUtterance = null;
-
-    setAudioStatus(
-      `${message} Tap Read reply aloud to retry.`
-    );
-  }
-
-  utterance.onstart = () => {
-    if (isCurrent()) {
-      setAudioStatus("Reading reply...");
-    }
-  };
-
-  utterance.onend = () => {
-    if (!isCurrent()) return;
-
-    clearTimeout(speechWatchdog);
-    speechWatchdog = null;
-    currentUtterance = null;
-
-    setAudioStatus("");
-
-    if (typeof reply.onDone === "function") {
-      followUpTimer = setTimeout(() => {
-        followUpTimer = null;
-
-        if (
-          reply.version === speechVersion &&
-          interactionMode === "voice" &&
-          !document.hidden &&
-          !currentUtterance &&
-          !queuedReply
-        ) {
-          reply.onDone();
-        }
-      }, 300);
-    }
-  };
-
-  utterance.onerror = event => {
-    console.error("Speech playback failed:", event.error);
-
-    fail(
-      `Audio failed: ${event.error || "unknown error"}.`
-    );
-  };
-
-  const timeout = Math.max(
-    15000,
-    5000 + reply.text.length * 160
-  );
-
-  speechWatchdog = setTimeout(() => {
-    if (!isCurrent()) return;
-
-    fail("Safari did not finish the spoken reply.");
-    synth.cancel();
-  }, timeout);
-
-  setAudioStatus("Starting spoken reply...");
-
-  try {
-    synth.speak(utterance);
-  } catch (error) {
-    console.error(error);
-    fail("Could not start spoken reply.");
-  }
-}
-
-function listenAuto() {
-  if (
-    interactionMode !== "voice" ||
-    !autoListenToggle.checked ||
-    document.hidden ||
-    micState !== "idle"
-  ) {
-    return;
-  }
-
-  startListening(true);
-}
-
-// ============================================================
-// Speech recognition
-// ============================================================
-
-function updateMicButton() {
-  if (!micBtn) return;
-
-  if (micState === "idle") {
-    micBtn.textContent = "🎤 Speak";
-  } else if (micState === "stopping") {
-    micBtn.textContent = "Stopping...";
   } else {
-    micBtn.textContent = "Stop listening";
+    note("No road found. Type a road or tap Speak to retry.");
+    reply("prompt:no-match", true);
   }
 }
 
-function setupVoiceButton() {
+// ============================================================
+// Microphone
+// ============================================================
+
+function updateMic() {
+  micBtn.textContent = micState === "idle"
+    ? "🎤 Speak"
+    : micState === "stopping"
+      ? "Stopping..."
+      : "Stop listening";
+}
+
+function setupMic() {
   if (!SpeechRec) {
     micBtn.hidden = true;
     return;
@@ -1914,92 +1586,84 @@ function setupVoiceButton() {
 
   micBtn.onclick = () => {
     if (micState !== "idle") {
-      beginTextInteraction(false);
+      enterTextMode(false);
       return;
     }
 
-    beginVoiceInteraction();
+    stopPlayback(true);
+    mode = "voice";
     startListening(false);
   };
 }
 
-function requestRecognitionStop(discardResult = false) {
+function stopRecognition(discard = false) {
   if (!recognizer || micState === "idle") return;
 
   const session = recognizer;
+  const wasStopping = micState === "stopping";
 
-  if (discardResult) {
-    session.ignoreResults = true;
-  }
+  if (discard) session.ignoreResults = true;
 
-  const alreadyStopping = micState === "stopping";
   micState = "stopping";
-  updateMicButton();
+  updateMic();
 
   try {
-    if (discardResult) {
+    if (discard) {
       session.abort();
-    } else if (!alreadyStopping) {
+    } else if (!wasStopping) {
       session.stop();
     }
   } catch (error) {
-    console.warn("Could not stop recognition:", error);
+    console.warn(error);
   }
 
-  if (micStopTimer) return;
+  if (stopTimer) return;
 
-  micStopTimer = setTimeout(() => {
-    micStopTimer = null;
+  stopTimer = setTimeout(() => {
+    stopTimer = null;
 
-    if (
-      recognizer !== session ||
-      micState === "idle"
-    ) {
-      return;
-    }
+    if (recognizer !== session || micState === "idle") return;
 
     session.ignoreResults = true;
 
     try {
       session.abort();
     } catch (error) {
-      console.warn("Could not abort recognition:", error);
+      console.warn(error);
     }
 
-    setAudioStatus(
+    status(
       "Safari has not reported that the microphone stopped. " +
-      "If it stays stuck, reload the page."
+      "Reload the page if it stays stuck."
     );
-  }, MIC_STOP_WARNING_MS);
+  }, 6000);
 }
 
 function startListening(automatic) {
   if (
     !SpeechRec ||
-    !dataReady ||
-    document.hidden ||
+    !ready ||
+    mode !== "voice" ||
     micState !== "idle" ||
-    interactionMode !== "voice"
+    playbackActive ||
+    queuedReply ||
+    document.hidden ||
+    (automatic && !autoToggle.checked)
   ) {
     return;
   }
-
-  if (automatic && !autoListenToggle.checked) return;
-  if (currentUtterance || queuedReply) return;
 
   let session;
 
   try {
     session = new SpeechRec();
   } catch (error) {
-    console.error(error);
-    setAudioStatus("Could not initialise voice input.");
+    status("Could not initialise the microphone.");
     return;
   }
 
   recognizer = session;
   session.ignoreResults = false;
-
   session.lang = "en-GB";
   session.continuous = false;
   session.interimResults = false;
@@ -2011,10 +1675,7 @@ function startListening(automatic) {
   session.onstart = () => {
     if (recognizer !== session) return;
 
-    if (
-      micState === "stopping" ||
-      interactionMode !== "voice"
-    ) {
+    if (micState === "stopping" || mode !== "voice") {
       session.ignoreResults = true;
 
       try {
@@ -2027,9 +1688,8 @@ function startListening(automatic) {
     }
 
     micState = "listening";
-    updateMicButton();
-
-    transcriptEl.textContent = "Listening...";
+    updateMic();
+    transcript.textContent = "Listening...";
   };
 
   session.onresult = event => {
@@ -2037,13 +1697,12 @@ function startListening(automatic) {
       recognizer !== session ||
       session.ignoreResults ||
       gotResult ||
-      interactionMode !== "voice"
+      mode !== "voice"
     ) {
       return;
     }
 
     const result = event.results[event.resultIndex];
-
     if (!result || !result.isFinal) return;
 
     const alternatives = Array.from(
@@ -2054,21 +1713,16 @@ function startListening(automatic) {
     if (!alternatives.length) return;
 
     gotResult = true;
-
-    transcriptEl.textContent =
-      `Heard: ${alternatives[0]}`;
+    transcript.textContent = `Heard: ${alternatives[0]}`;
 
     try {
       handleVoice(alternatives);
     } catch (error) {
       console.error(error);
-      cancelSpeech();
-
-      setAudioStatus(
-        "Could not process that request. Tap Speak to try again."
-      );
+      stopPlayback();
+      status("Could not process that request. Tap Speak to retry.");
     } finally {
-      requestRecognitionStop();
+      stopRecognition();
     }
   };
 
@@ -2076,93 +1730,60 @@ function startListening(automatic) {
     if (recognizer !== session) return;
 
     hadError = true;
+    if (session.ignoreResults || mode !== "voice") return;
 
-    if (
-      session.ignoreResults ||
-      interactionMode !== "voice"
-    ) {
-      return;
-    }
-
-    console.warn("Recognition error:", event.error);
-
-    if (event.error === "no-speech") {
-      transcriptEl.textContent =
-        "Didn't hear anything. Tap Speak to try again.";
-    } else if (event.error === "not-allowed") {
-      transcriptEl.textContent = automatic
-        ? "Tap Speak and say your choice."
-        : (
-          "Microphone access was denied. Check Safari's " +
-          "microphone permission for this site."
-        );
-    } else if (event.error === "audio-capture") {
-      transcriptEl.textContent =
-        "Microphone unavailable. Check other apps or audio devices.";
-    } else if (event.error === "aborted") {
-      if (!gotResult) {
-        transcriptEl.textContent =
-          "Listening stopped. Tap Speak to try again.";
-      }
-    } else {
-      transcriptEl.textContent =
-        `Voice input failed: ${event.error}. Tap Speak to retry.`;
+    if (event.error === "not-allowed") {
+      transcript.textContent = automatic
+        ? "Tap Speak to answer."
+        : "Microphone access denied. Check Safari permissions.";
+    } else if (event.error === "no-speech") {
+      transcript.textContent = "Nothing heard. Tap Speak to retry.";
+    } else if (event.error !== "aborted" || !gotResult) {
+      transcript.textContent =
+        `Voice input: ${event.error}. Tap Speak to retry.`;
     }
   };
 
   session.onend = () => {
     if (recognizer !== session) return;
 
-    clearTimeout(micStopTimer);
-    micStopTimer = null;
+    clearTimeout(stopTimer);
+    stopTimer = null;
 
     recognizer = null;
     micState = "idle";
     micReleasedAt = Date.now();
-
-    updateMicButton();
+    updateMic();
 
     if (
       !gotResult &&
       !hadError &&
       !session.ignoreResults &&
-      interactionMode === "voice"
+      mode === "voice"
     ) {
-      transcriptEl.textContent =
-        "Didn't hear anything. Tap Speak to try again.";
+      transcript.textContent = "Nothing heard. Tap Speak to retry.";
     }
 
     if (queuedReply) {
-      flushSpeech();
-    } else if (!currentUtterance && !document.hidden) {
-      setAudioStatus("");
+      flushPlayback();
     }
   };
 
   micState = "starting";
-  updateMicButton();
-
-  transcriptEl.textContent = "Starting microphone...";
-  setAudioStatus("");
+  updateMic();
+  transcript.textContent = "Starting microphone...";
+  status("");
 
   try {
     session.start();
   } catch (error) {
-    console.error(error);
-
     if (recognizer === session) {
       recognizer = null;
       micState = "idle";
-      updateMicButton();
+      updateMic();
     }
 
-    transcriptEl.textContent =
-      "Could not start listening. Tap Speak to try again.";
-
-    if (automatic) {
-      setAudioStatus(
-        "Safari may require another tap to start the microphone."
-      );
-    }
+    transcript.textContent =
+      "Could not start listening. Tap Speak to retry.";
   }
 }
