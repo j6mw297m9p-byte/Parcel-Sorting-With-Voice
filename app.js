@@ -112,8 +112,7 @@ let pending = null;
 let suggestions = null;
 let typingTimer = null;
 
-// Text mode NEVER automatically speaks.
-// Only microphone input switches this to voice mode.
+// Text interactions never automatically speak.
 let interactionMode = "text";
 
 // Microphone states:
@@ -146,7 +145,7 @@ let micBtn;
 let transcriptEl;
 let resetBtn;
 
-// Extra controls created by JavaScript.
+// Extra audio controls.
 let replayBtn;
 let audioStatus;
 let autoListenToggle;
@@ -193,21 +192,17 @@ document.addEventListener("DOMContentLoaded", () => {
 
   resetBtn.onclick = reset;
 
-  // Focusing the text field also ends the voice interaction.
   input.addEventListener("focus", () => {
     beginTextInteraction(false);
   });
 
   input.addEventListener("input", () => {
     beginTextInteraction();
-
     handleInput(input.value, "live");
 
     if (pending && isNumberOrPostcode(input.value)) {
       typingTimer = setTimeout(() => {
         typingTimer = null;
-
-        // This remains a silent text interaction.
         handleInput(input.value, "pause");
       }, PAUSE_MS);
     }
@@ -255,15 +250,17 @@ function createAudioControls() {
 
     const text = lastReply;
 
-    // Explicit playback is allowed even in silent text mode.
-    // It does NOT automatically restart the microphone.
+    // Explicit playback does not restart the microphone.
     beginTextInteraction(false);
     speak(text);
   };
 
   const label = document.createElement("label");
-  label.style.display = "block";
-  label.style.marginTop = "10px";
+
+  Object.assign(label.style, {
+    display: "block",
+    marginTop: "10px"
+  });
 
   autoListenToggle = document.createElement("input");
   autoListenToggle.type = "checkbox";
@@ -299,12 +296,8 @@ function createAudioControls() {
     margin: "8px 0"
   });
 
-  const version = document.createElement("small");
-  version.textContent =
-    "Silent typing version 1.0 — typed searches do not speak.";
-  version.style.display = "block";
-
-  controls.append(replayBtn, label, audioStatus, version);
+  // No version/debug message is added.
+  controls.append(replayBtn, label, audioStatus);
   transcriptEl.insertAdjacentElement("afterend", controls);
 }
 
@@ -326,7 +319,7 @@ function writePreference(key, value) {
   try {
     localStorage.setItem(key, value);
   } catch (error) {
-    // Preferences are optional.
+    // Saved preferences are optional.
   }
 }
 
@@ -358,8 +351,6 @@ function beginVoiceInteraction() {
   interactionMode = "voice";
 }
 
-// Every result can have a readable reply, but only voice
-// interactions automatically send it to speech synthesis.
 function respond(text, onDone) {
   rememberReply(text);
 
@@ -435,7 +426,7 @@ function parseCsv(text) {
     const road = (columns[0] || "").trim();
 
     if (!road) {
-      // Your file separates ME10 and ME9 with blank rows.
+      // Your CSV separates ME10 and ME9 with blank rows.
       if (entries.length && areaName === "ME10") {
         areaName = "ME9";
       }
@@ -1078,6 +1069,7 @@ function showByWalk(key) {
 function showDuties(matches) {
   pending = null;
   suggestions = null;
+
   compactGrids();
   results.innerHTML = "";
 
@@ -1113,8 +1105,8 @@ function dutyMessage(matches) {
 
 function resultRow(entry) {
   const row = document.createElement("li");
-  const name = document.createElement("span");
 
+  const name = document.createElement("span");
   name.className = "road";
   name.textContent = entry.base;
 
@@ -1174,7 +1166,6 @@ function optionRow(label, onClick, dashed = false) {
   }
 
   button.onclick = () => {
-    // Tapping a result is always silent.
     beginTextInteraction();
     onClick();
   };
@@ -1184,6 +1175,12 @@ function optionRow(label, onClick, dashed = false) {
 }
 
 function askDetail(matches, message) {
+  // Typed searches display every matching entry directly.
+  if (interactionMode !== "voice") {
+    showDuties(matches);
+    return;
+  }
+
   pending = { matches };
   compactGrids();
   showNote(message);
@@ -1426,8 +1423,6 @@ function handleInput(text, mode) {
   }
 
   if (suggestions) {
-    // Preserve the choices while typing an answer.
-    // Enter submits that answer.
     if (mode !== "final") {
       rememberReply(
         suggestions.stage === "confirm"
@@ -1442,13 +1437,12 @@ function handleInput(text, mode) {
     suggestions = null;
   }
 
+  // A pending detail question can originate from a voice search.
+  // If the user types an answer, process it silently.
   if (pending) {
     const hits = answerPending(query);
 
     if (hits) {
-      // During live typing, retain the original candidates.
-      // This prevents a partial house number permanently
-      // replacing the open detail question.
       const openQuestion = pending;
 
       showDuties(hits);
@@ -1472,15 +1466,14 @@ function handleInput(text, mode) {
       isNumberOrPostcode(query) ||
       (query.length >= 3 && !looksLikeRoad(query))
     ) {
-      if (mode === "final" || mode === "pause") {
+      if (interactionMode === "text") {
+        // Show the available entries instead of a clarification.
+        showDuties(pending.matches);
+      } else if (mode === "final" || mode === "pause") {
         askDetail(
           pending.matches,
           `No match for ${query}. ` +
           "Try another house number or postcode."
-        );
-      } else {
-        rememberReply(
-          "Which house number or postcode?"
         );
       }
 
@@ -1561,7 +1554,12 @@ function lookup(query) {
     return;
   }
 
-  if (needsDetail(matches)) {
+  // Only microphone searches ask for additional details.
+  // Typed searches display every matching CSV entry.
+  if (
+    interactionMode === "voice" &&
+    needsDetail(matches)
+  ) {
     askDetail(
       matches,
       `${matches[0].base} has ${matches.length} entries. ` +
@@ -1968,7 +1966,6 @@ function requestRecognitionStop(discardResult = false) {
       console.warn("Could not abort recognition:", error);
     }
 
-    // Do not falsely mark the mic idle before onend.
     setAudioStatus(
       "Safari has not reported that the microphone stopped. " +
       "If it stays stuck, reload the page."
@@ -1987,9 +1984,7 @@ function startListening(automatic) {
     return;
   }
 
-  // Extra safeguard against restarting from a stale callback.
   if (automatic && !autoListenToggle.checked) return;
-
   if (currentUtterance || queuedReply) return;
 
   let session;
